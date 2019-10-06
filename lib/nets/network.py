@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 import numpy
+import sys
 
 import utils.timer
 
@@ -39,16 +40,25 @@ class Network(nn.Module):
         nn.Module.__init__(self)
         self._predictions = {}
         self._losses = {}
+        self._cum_losses = {}
         self._anchor_targets = {}
         self._proposal_targets = {}
         self._layers = {}
         self._gt_image = None
         self._act_summaries = {}
         self._score_summaries = {}
+        self._val_event_summaries = {}
         self._event_summaries = {}
         self._image_gt_summaries = {}
         self._variables_to_fix = {}
         self._device = 'cuda'
+        self._cum_losses['total_loss']        = 0
+        self._cum_losses['rpn_cross_entropy'] = 0
+        self._cum_losses['rpn_loss_box']      = 0
+        self._cum_losses['cross_entropy']     = 0
+        self._cum_losses['loss_box']          = 0
+        self._cum_gt_entries                  = 0
+        self._batch_gt_entries                = 0
 
     def _add_gt_image(self):
         # add back mean
@@ -103,6 +113,7 @@ class Network(nn.Module):
                         0)(bottom, rois)
 
     def _anchor_target_layer(self, rpn_cls_score):
+        #.data is used to pull a tensor from a pytorch variable. Deprecated, but it grabs a copy of the data that will not be tracked by gradients
         rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = \
             anchor_target_layer(rpn_cls_score.data, self._gt_boxes.data.cpu().numpy(), self._im_info, self._feat_stride, self._anchors.data.cpu().numpy(), self._num_anchors)
 
@@ -122,10 +133,8 @@ class Network(nn.Module):
         rpn_labels = rpn_labels.long()
         self._anchor_targets['rpn_labels'] = rpn_labels
         self._anchor_targets['rpn_bbox_targets'] = rpn_bbox_targets
-        self._anchor_targets[
-            'rpn_bbox_inside_weights'] = rpn_bbox_inside_weights
-        self._anchor_targets[
-            'rpn_bbox_outside_weights'] = rpn_bbox_outside_weights
+        self._anchor_targets['rpn_bbox_inside_weights'] = rpn_bbox_inside_weights
+        self._anchor_targets['rpn_bbox_outside_weights'] = rpn_bbox_outside_weights
 
         for k in self._anchor_targets.keys():
             self._score_summaries[k] = self._anchor_targets[k]
@@ -166,31 +175,42 @@ class Network(nn.Module):
                         dim=[1]):
         sigma_2 = sigma**2
         box_diff = bbox_pred - bbox_targets
+        #print(bbox_targets.size())
+        #print(bbox_pred.size())
+        #Ignore diff when target is not a foreground target
         in_box_diff = bbox_inside_weights * box_diff
         abs_in_box_diff = torch.abs(in_box_diff)
         smoothL1_sign = (abs_in_box_diff < 1. / sigma_2).detach().float()
-        in_loss_box = torch.pow(in_box_diff, 2) * (sigma_2 / 2.) * smoothL1_sign \
-                      + (abs_in_box_diff - (0.5 / sigma_2)) * (1. - smoothL1_sign)
+        in_loss_box = torch.pow(in_box_diff, 2) * (sigma_2 / 2.) * smoothL1_sign + (abs_in_box_diff - (0.5 / sigma_2)) * (1. - smoothL1_sign)
+        #Used to normalize the predictions?
         out_loss_box = bbox_outside_weights * in_loss_box
         loss_box = out_loss_box
+        #Condense down to 1D array, each entry is the box_loss for an individual box, array is batch size of all predicted boxes
+        #[loss,y,x,num_anchor]
         for i in sorted(dim, reverse=True):
             loss_box = loss_box.sum(i)
+        #print(loss_box.size())
         loss_box = loss_box.mean()
         return loss_box
-
+    #Determine losses for single batch image
     def _add_losses(self, sigma_rpn=3.0):
-        print('Adding Losses')
         # RPN, class loss
+        #View rearranges the matrix to match specified dimension -1 is inferred from other dims, probably OBJ/Not OBJ
         rpn_cls_score = self._predictions['rpn_cls_score_reshape'].view(-1, 2)
+        #What is the target label out of the RPN
         rpn_label = self._anchor_targets['rpn_labels'].view(-1)
+        #Remove all non zeros to get an index list of target objects, not non-objects
         rpn_select = (rpn_label.data != -1).nonzero().view(-1)
         rpn_cls_score = rpn_cls_score.index_select(
             0, rpn_select).contiguous().view(-1, 2)
+        #Returns a new tensor which indexes the input tensor along dimension dim using the entries in index which is a LongTensor.
         rpn_label = rpn_label.index_select(0, rpn_select).contiguous().view(-1)
         #torch.nn.functional
-        rpn_cross_entropy = F.cross_entropy(rpn_cls_score, rpn_label)
+        #Compare labels from anchor_target_layer and rpn_layer
+        rpn_cross_entropy = F.cross_entropy(rpn_cls_score, rpn_label, reduction='mean')
 
         # RPN, bbox loss
+
         rpn_bbox_pred = self._predictions['rpn_bbox_pred']
         rpn_bbox_targets = self._anchor_targets['rpn_bbox_targets']
         rpn_bbox_inside_weights = self._anchor_targets[
@@ -226,11 +246,7 @@ class Network(nn.Module):
         #Computed losses
         loss = cross_entropy + loss_box + rpn_cross_entropy + rpn_loss_box
         self._losses['total_loss'] = loss
-        print('Total Loss {:f}'.format(loss));
-        for k in self._losses.keys():
-            #Need to add average of losses here
-            self._event_summaries[k] += self._losses[k]
-
+        #print('individual image loss:{:f}'.format(loss))
         return loss
 
     def _region_proposal(self, net_conv):
@@ -343,40 +359,40 @@ class Network(nn.Module):
 
         self.init_weights()
 
-    def _run_summary_op(self, val=False, summary_size):
+    def _run_summary_op(self, val=False, summary_size=1):
         """
-    Run the summary operator: feed the placeholders with corresponding newtork outputs(activations)
-    """
+            Run the summary operator: feed the placeholders with corresponding network outputs(activations)
+        """
         summaries = []
         # Add image gt
         summaries.append(self._add_gt_image_summary())
         # Add event_summaries
-        for key, var in self._event_summaries.items():
-            #print(key)
-            #print(var)
-            summaries.append(tb.summary.scalar(key, var.item()/float(summary_size)))
-        self._event_summaries = {}
         if not val:
+            for key, var in self._event_summaries.items():
+                #print("adding summary for key {:s} with value {:f} and summary size divisor {:d}".format(key,var,summary_size))
+                summaries.append(tb.summary.scalar(key, var/float(summary_size)))
+            #Reset summary val
+            self._event_summaries = {}
             # Add score summaries
             for key, var in self._score_summaries.items():
-                #print(key)
-                #print(var)
                 summaries.append(self._add_score_summary(key, var))
             self._score_summaries = {}
             # Add act summaries
             for key, var in self._act_summaries.items():
-                #print(key)
-                #print(var)
                 summaries += self._add_act_summary(key, var)
             self._act_summaries = {}
             # Add train summaries
             for k, var in dict(self.named_parameters()).items():
-                #print(k)
-                #print(var)
                 if var.requires_grad:
                     summaries.append(self._add_train_summary(k, var))
 
             self._image_gt_summaries = {}
+        else:
+            for key, var in self._val_event_summaries.items():
+                #print("adding validation summary for key {:s} with value {:f} and summary size divisor {:d}".format(key,var,summary_size))
+                summaries.append(tb.summary.scalar(key, var/float(summary_size)))
+            #Reset summary val
+            self._val_event_summaries = {}
 
         return summaries
 
@@ -401,6 +417,7 @@ class Network(nn.Module):
             pool5 = self._roi_pool_layer(net_conv, rois)
 
         if self._mode == 'TRAIN':
+            #Find best algo
             torch.backends.cudnn.benchmark = True  # benchmark because now the input size are fixed
         fc7 = self._head_to_tail(pool5)
 
@@ -431,6 +448,7 @@ class Network(nn.Module):
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
+            #Batch Norm?
             self._predictions["bbox_pred"] = bbox_pred.mul(stds).add(means)
         else:
             self._add_losses()  # compute losses
@@ -482,17 +500,23 @@ class Network(nn.Module):
                 del d[k]
 
     def get_summary(self, blobs, sum_size):
+        #Flip between eval and train mode
         self.eval()
         self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'])
         self.train()
-        summary = self._run_summary_op(True,summary_size=sum_size)
-
+        for k in self._losses.keys():
+            if(k in self._val_event_summaries):
+                self._val_event_summaries[k] += self._losses[k]
+            else:
+                self._val_event_summaries[k] = self._losses[k]
+        summary = self._run_summary_op(True,len(blobs['gt_boxes']))
+        self.delete_intermediate_states()
         return summary
 
     def train_step(self, blobs, train_op, update_weights=False):
-        #Computes losses
+        #Computes losses for single image
         self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'])
-        #.item() converts single element tensor to a float/int
+        #.item() converts single element of type pytorch.tensor to a primitive float/int
         rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self._losses["rpn_cross_entropy"].item(), \
                                                                             self._losses['rpn_loss_box'].item(), \
                                                                             self._losses['cross_entropy'].item(), \
@@ -501,29 +525,39 @@ class Network(nn.Module):
         #utils.timer.timer.tic('backward')
         self._losses['total_loss'].backward()
         #utils.timer.timer.toc('backward')
+        self._cum_losses['total_loss']        += loss
+        self._cum_losses['rpn_cross_entropy'] += rpn_loss_cls
+        self._cum_losses['rpn_loss_box']      += rpn_loss_box
+        self._cum_losses['cross_entropy']     += loss_cls
+        self._cum_losses['loss_box']          += loss_box
+        self._batch_gt_entries                += len(blobs['gt_boxes'])
         if(update_weights):
+            #print('updating weights to end batch')
+            #print(self._cum_losses['total_loss'])
             train_op.step()
             train_op.zero_grad()
-
+            for k in self._cum_losses.keys():
+                if(k in self._event_summaries):
+                    self._event_summaries[k] += self._cum_losses[k]
+                else:
+                    self._event_summaries[k] = self._cum_losses[k]
+            self._cum_gt_entries                  += self._batch_gt_entries
+            #print('num GT boxes')
+            #print(self._cum_gt_entries)
+            self._cum_losses['total_loss']        = 0
+            self._cum_losses['rpn_cross_entropy'] = 0
+            self._cum_losses['rpn_loss_box']      = 0
+            self._cum_losses['cross_entropy']     = 0
+            self._cum_losses['loss_box']          = 0
+            self._batch_gt_entries                = 0
         self.delete_intermediate_states()
 
         return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss
 
-    def train_step_with_summary(self, blobs, train_op, update_weights=False,sum_size):
-        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'])
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self._losses["rpn_cross_entropy"].item(), \
-                                                                            self._losses['rpn_loss_box'].item(), \
-                                                                            self._losses['cross_entropy'].item(), \
-                                                                            self._losses['loss_box'].item(), \
-                                                                            self._losses['total_loss'].item()
-        self._losses['total_loss'].backward()
-        if(update_weights):
-            train_op.step()
-            train_op.zero_grad()
-        summary = self._run_summary_op(summary_size=sum_size)
-
-        self.delete_intermediate_states()
-        #print(summary)
+    def train_step_with_summary(self, blobs, train_op, sum_size, update_weights=False):
+        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self.train_step(blobs, train_op, update_weights)
+        summary = self._run_summary_op(False, self._cum_gt_entries)
+        self._cum_gt_entries = 0
         return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, summary
 
     def train_step_no_return(self, blobs, train_op):
@@ -533,6 +567,13 @@ class Network(nn.Module):
         train_op.step()
         self.delete_intermediate_states()
 
+    def print_cumulative_loss(self, batch_start_iter, iter, max_iters, lr):
+        div = float(self._batch_gt_entries)
+        if(div == 0):
+            return
+        print('iter: %d - %d / %d, total batch loss: %.6f\n >>> rpn_loss_cls: %.6f\n '
+                '>>> rpn_loss_box: %.6f\n >>> loss_cls: %.6f\n >>> loss_box: %.6f\n >>> lr: %f' % \
+                (batch_start_iter, iter, max_iters, self._cum_losses['total_loss']/div, self._cum_losses['rpn_cross_entropy']/div, self._cum_losses['rpn_loss_box']/div, self._cum_losses['cross_entropy']/div, self._cum_losses['loss_box']/div, lr))
 
 
     def load_state_dict(self, state_dict):
