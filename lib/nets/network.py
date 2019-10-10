@@ -115,7 +115,7 @@ class Network(nn.Module):
     def _anchor_target_layer(self, rpn_cls_score):
         #.data is used to pull a tensor from a pytorch variable. Deprecated, but it grabs a copy of the data that will not be tracked by gradients
         rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = \
-            anchor_target_layer(rpn_cls_score.data, self._gt_boxes.data.cpu().numpy(), self._im_info, self._feat_stride, self._anchors.data.cpu().numpy(), self._num_anchors)
+            anchor_target_layer(rpn_cls_score.data, self._gt_boxes.data.cpu().numpy(), self._gt_boxes_dc.data.cpu().numpy(), self._im_info, self._feat_stride, self._anchors.data.cpu().numpy(), self._num_anchors)
 
         rpn_labels = torch.from_numpy(rpn_labels).float().to(
             self._device)  #.set_shape([1, 1, None, None])
@@ -143,7 +143,7 @@ class Network(nn.Module):
 
     def _proposal_target_layer(self, rois, roi_scores):
         rois, roi_scores, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights = \
-            proposal_target_layer(rois, roi_scores, self._gt_boxes, self._num_classes)
+            proposal_target_layer(rois, roi_scores, self._gt_boxes, self._gt_boxes_dc, self._num_classes)
 
         self._proposal_targets['rois'] = rois
         self._proposal_targets['labels'] = labels.long()
@@ -258,13 +258,14 @@ class Network(nn.Module):
 
         rpn_cls_score = self.rpn_cls_score_net(
             rpn)  # batch * (num_anchors * 2) * h * w
-
-        # change it so that the score has 2 as its channel size
+        #print(rpn_cls_score.size())
+        # change it so that the score has 2 as its channel size for softmax
         rpn_cls_score_reshape = rpn_cls_score.view(
             1, 2, -1,
             rpn_cls_score.size()[-1])  # batch * 2 * (num_anchors*h) * w
+        #print(rpn_cls_score_reshape[0,:,1,1])
         rpn_cls_prob_reshape = F.softmax(rpn_cls_score_reshape, dim=1)
-
+        #print(rpn_cls_prob_reshape[0,:,1,1])
         # Move channel to the last dimenstion, to fit the input of python functions
         rpn_cls_prob = rpn_cls_prob_reshape.view_as(rpn_cls_score).permute(
             0, 2, 3, 1)  # batch * h * w * (num_anchors * 2)
@@ -428,9 +429,10 @@ class Network(nn.Module):
 
         return rois, cls_prob, bbox_pred
 
-    def forward(self, image, im_info, gt_boxes=None, mode='TRAIN'):
+    def forward(self, image, im_info, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
         self._image_gt_summaries['image'] = image
         self._image_gt_summaries['gt_boxes'] = gt_boxes
+        self._image_gt_summaries['gt_boxes_dc'] = gt_boxes_dc
         self._image_gt_summaries['im_info'] = im_info
         #plt.imshow(image[0,:,:,:])
         #plt.show()
@@ -439,7 +441,8 @@ class Network(nn.Module):
         self._im_info = im_info  # No need to change; actually it can be an list
         self._gt_boxes = torch.from_numpy(gt_boxes).to(
             self._device) if gt_boxes is not None else None
-
+        self._gt_boxes_dc = torch.from_numpy(gt_boxes_dc).to(
+            self._device) if gt_boxes is not None else None
         self._mode = mode
 
         rois, cls_prob, bbox_pred = self._predict()
@@ -483,7 +486,7 @@ class Network(nn.Module):
     def test_image(self, image, im_info):
         self.eval()
         with torch.no_grad():
-            self.forward(image, im_info, None, mode='TEST')
+            self.forward(image, im_info, None, None, mode='TEST')
         cls_score, cls_prob, bbox_pred, rois = self._predictions["cls_score"].data.cpu().numpy(), \
                                                          self._predictions['cls_prob'].data.cpu().numpy(), \
                                                          self._predictions['bbox_pred'].data.cpu().numpy(), \
@@ -502,7 +505,7 @@ class Network(nn.Module):
     def get_summary(self, blobs, sum_size):
         #Flip between eval and train mode
         self.eval()
-        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'])
+        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
         self.train()
         for k in self._losses.keys():
             if(k in self._val_event_summaries):
@@ -515,7 +518,7 @@ class Network(nn.Module):
 
     def train_step(self, blobs, train_op, update_weights=False):
         #Computes losses for single image
-        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'])
+        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
         #.item() converts single element of type pytorch.tensor to a primitive float/int
         rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self._losses["rpn_cross_entropy"].item(), \
                                                                             self._losses['rpn_loss_box'].item(), \
@@ -561,7 +564,7 @@ class Network(nn.Module):
         return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, summary
 
     def train_step_no_return(self, blobs, train_op):
-        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'])
+        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
         train_op.zero_grad()
         self._losses['total_loss'].backward()
         train_op.step()
