@@ -355,8 +355,7 @@ class Network(nn.Module):
                                            self._num_anchors * 4, [1, 1])
 
         self.cls_score_net = nn.Linear(self._fc7_channels, self._num_classes)
-        self.bbox_pred_net = nn.Linear(self._fc7_channels,
-                                       self._num_classes * 4)
+        self.bbox_pred_net = nn.Linear(self._fc7_channels, self._num_classes * 4)
 
         self.init_weights()
 
@@ -434,8 +433,6 @@ class Network(nn.Module):
         self._image_gt_summaries['gt_boxes'] = gt_boxes
         self._image_gt_summaries['gt_boxes_dc'] = gt_boxes_dc
         self._image_gt_summaries['im_info'] = im_info
-        #plt.imshow(image[0,:,:,:])
-        #plt.show()
         self._image = torch.from_numpy(image.transpose([0, 3, 1,
                                                         2])).to(self._device)
         self._im_info = im_info  # No need to change; actually it can be an list
@@ -444,9 +441,22 @@ class Network(nn.Module):
         self._gt_boxes_dc = torch.from_numpy(gt_boxes_dc).to(
             self._device) if gt_boxes is not None else None
         self._mode = mode
+        if(mode == 'VAL'):
+            self._mode = 'TRAIN'
 
         rois, cls_prob, bbox_pred = self._predict()
         if mode == 'TEST':
+            #These are the deltas and they come out of the NN normalized, need to undo this
+            stds = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(
+                self._num_classes).unsqueeze(0).expand_as(bbox_pred)
+            means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
+                self._num_classes).unsqueeze(0).expand_as(bbox_pred)
+            #Batch Norm?
+            self._predictions["bbox_pred"] = bbox_pred.mul(stds).add(means)
+        elif(mode == 'VAL'):
+            self._add_losses()
+            #????
+            #Expand as -> broadcast 
             stds = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
@@ -501,12 +511,17 @@ class Network(nn.Module):
         ]:
             for k in list(d):
                 del d[k]
-
-    def get_summary(self, blobs, sum_size):
-        #Flip between eval and train mode
-        self.eval()
-        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
+                
+    #Eval summary required
+    def run_eval(self, blobs, sum_size):
+        #Flip between eval and train mode -> gradient doesnt accumulate?
+        self.eval() # model.eval() will notify all your layers that you are in eval mode, that way, batchnorm or dropout layers will work in eval mode instead of training mode.
+        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
         self.train()
+        bbox_predictions = self._predictions['bbox_pred'].data.cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
+        cls_prob        = self._predictions['cls_prob'].data.cpu().numpy() #(self._fc7_channels, self._num_classes)
+        rois             = self._predictions['rois'].data.cpu().numpy()
+        #For tensorboard
         for k in self._losses.keys():
             if(k in self._val_event_summaries):
                 self._val_event_summaries[k] += self._losses[k]
@@ -514,7 +529,7 @@ class Network(nn.Module):
                 self._val_event_summaries[k] = self._losses[k]
         summary = self._run_summary_op(True,len(blobs['gt_boxes']))
         self.delete_intermediate_states()
-        return summary
+        return summary, rois, bbox_predictions, cls_prob
 
     def train_step(self, blobs, train_op, update_weights=False):
         #Computes losses for single image
