@@ -282,6 +282,7 @@ class Network(nn.Module):
         if self._mode == 'TRAIN':
             rois, roi_scores = self._proposal_layer(
                 rpn_cls_prob, rpn_bbox_pred)  # rois, roi_scores are varible
+            #target labels and roi's to supply later half of network with golden results
             rpn_labels = self._anchor_target_layer(rpn_cls_score)
             rois, _ = self._proposal_target_layer(rois, roi_scores)
         else:
