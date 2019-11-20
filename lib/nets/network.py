@@ -59,6 +59,9 @@ class Network(nn.Module):
         self._cum_losses['loss_box']          = 0
         self._cum_gt_entries                  = 0
         self._batch_gt_entries                = 0
+        #Set on every forward pass for use with proposal target layer
+        self._gt_boxes = None
+        self._gt_boxes_dc = None
 
     def _add_gt_image(self):
         # add back mean
@@ -142,7 +145,7 @@ class Network(nn.Module):
         return rpn_labels
 
     def _proposal_target_layer(self, rois, roi_scores):
-        rois, roi_scores, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights = \
+        labels, rois, roi_scores, bbox_targets, bbox_inside_weights, bbox_outside_weights = \
             proposal_target_layer(rois, roi_scores, self._gt_boxes, self._gt_boxes_dc, self._num_classes)
 
         self._proposal_targets['rois'] = rois
@@ -199,8 +202,12 @@ class Network(nn.Module):
         rpn_cls_score = self._predictions['rpn_cls_score_reshape'].view(-1, 2)
         #What is the target label out of the RPN
         rpn_label = self._anchor_targets['rpn_labels'].view(-1)
-        #Remove all non zeros to get an index list of target objects, not non-objects
+        #Remove all non zeros to get an index list of target objects, not dontcares
+        #.nonzero() returns indices
         rpn_select = (rpn_label.data != -1).nonzero().view(-1)
+        #TODO: RPN class score is indexed by the GT entries. That doesnt seem right. Need to investigate
+        #Upon further investigation it appears based upon the entries in the generated anchors. If anchors and targets have an associated size then 
+        #That would make this make sense.
         rpn_cls_score = rpn_cls_score.index_select(
             0, rpn_select).contiguous().view(-1, 2)
         #Returns a new tensor which indexes the input tensor along dimension dim using the entries in index which is a LongTensor.
@@ -285,6 +292,7 @@ class Network(nn.Module):
             #target labels and roi's to supply later half of network with golden results
             rpn_labels = self._anchor_target_layer(rpn_cls_score)
             rois, _ = self._proposal_target_layer(rois, roi_scores)
+            self._predictions['rpn_labels'] = rpn_labels
         else:
             if cfg.TEST.MODE == 'nms':
                 rois, _ = self._proposal_layer(rpn_cls_prob, rpn_bbox_pred)
@@ -293,12 +301,12 @@ class Network(nn.Module):
             else:
                 raise NotImplementedError
 
-        self._predictions["rpn_cls_score"] = rpn_cls_score
-        self._predictions["rpn_cls_score_reshape"] = rpn_cls_score_reshape
-        self._predictions["rpn_cls_prob"] = rpn_cls_prob
-        self._predictions["rpn_cls_pred"] = rpn_cls_pred
-        self._predictions["rpn_bbox_pred"] = rpn_bbox_pred
-        self._predictions["rois"] = rois
+        self._predictions['rpn_cls_score'] = rpn_cls_score
+        self._predictions['rpn_cls_score_reshape'] = rpn_cls_score_reshape
+        self._predictions['rpn_cls_prob'] = rpn_cls_prob
+        self._predictions['rpn_cls_pred'] = rpn_cls_pred
+        self._predictions['rpn_bbox_pred'] = rpn_bbox_pred
+        self._predictions['rois'] = rois
 
         return rois
 
@@ -308,10 +316,10 @@ class Network(nn.Module):
         cls_prob = F.softmax(cls_score, dim=1)
         bbox_pred = self.bbox_pred_net(fc7)
 
-        self._predictions["cls_score"] = cls_score
-        self._predictions["cls_pred"] = cls_pred
-        self._predictions["cls_prob"] = cls_prob
-        self._predictions["bbox_pred"] = bbox_pred
+        self._predictions['cls_score'] = cls_score
+        self._predictions['cls_pred'] = cls_pred
+        self._predictions['cls_prob'] = cls_prob
+        self._predictions['bbox_pred'] = bbox_pred
 
         return cls_prob, bbox_pred
 
@@ -427,7 +435,7 @@ class Network(nn.Module):
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
 
-        return rois, cls_prob, bbox_pred
+        return cls_prob, bbox_pred
 
     def forward(self, image, im_info, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
         self._image_gt_summaries['image'] = image
@@ -445,7 +453,7 @@ class Network(nn.Module):
         if(mode == 'VAL'):
             self._mode = 'TRAIN'
 
-        rois, cls_prob, bbox_pred = self._predict()
+        cls_prob, bbox_pred = self._predict()
         if mode == 'TEST':
             #These are the deltas and they come out of the NN normalized, need to undo this
             stds = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(
@@ -453,7 +461,7 @@ class Network(nn.Module):
             means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             #Batch Norm?
-            self._predictions["bbox_pred"] = bbox_pred.mul(stds).add(means)
+            self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
         elif(mode == 'VAL'):
             self._add_losses()
             #????
@@ -463,7 +471,7 @@ class Network(nn.Module):
             means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             #Batch Norm?
-            self._predictions["bbox_pred"] = bbox_pred.mul(stds).add(means)
+            self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
         else:
             self._add_losses()  # compute losses
 
@@ -520,8 +528,9 @@ class Network(nn.Module):
         self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
         self.train()
         bbox_predictions = self._predictions['bbox_pred'].data.cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
-        cls_prob        = self._predictions['cls_prob'].data.cpu().numpy() #(self._fc7_channels, self._num_classes)
+        cls_prob         = self._predictions['cls_prob'].data.cpu().numpy() #(self._fc7_channels, self._num_classes)
         rois             = self._predictions['rois'].data.cpu().numpy()
+        roi_labels       = self._proposal_targets['labels'].data.cpu().numpy()
         #For tensorboard
         for k in self._losses.keys():
             if(k in self._val_event_summaries):
@@ -530,7 +539,7 @@ class Network(nn.Module):
                 self._val_event_summaries[k] = self._losses[k]
         summary = self._run_summary_op(True,len(blobs['gt_boxes']))
         self.delete_intermediate_states()
-        return summary, rois, bbox_predictions, cls_prob
+        return summary, rois, roi_labels, bbox_predictions, cls_prob
 
     def train_step(self, blobs, train_op, update_weights=False):
         #Computes losses for single image
