@@ -100,9 +100,9 @@ if __name__ == '__main__':
     if(manual_mode):
         args.net = 'res101'
         args.imdb_name = 'Kitti'
-        args.weights_file = 'weights/res101_faster_rcnn_iter_210001.pth'
+        args.weights_file = 'weights/car_only_res101_faster_rcnn_iter_135000.pth'
         args.out_dir = 'output/'
-        args.imdb_root_dir = '/home/mat/Thesis/data/Kitti/'
+        args.imdb_root_dir = '/home/mat/thesis/data/Kitti/'
     print('Called with args:')
     print(args)
     if args.cfg_file is not None:

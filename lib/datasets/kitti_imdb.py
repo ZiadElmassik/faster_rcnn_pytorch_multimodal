@@ -43,9 +43,7 @@ class kitti_imdb(imdb):
             self._mode_sub_folder = 'experiment'
         self._classes = (
             'dontcare',  # always index 0
-            'Pedestrian',
-            'Car',
-            'Cyclist')
+            'Car')
 
         self.config = {
             'cleanup': True,
@@ -173,6 +171,10 @@ class kitti_imdb(imdb):
             if(label_arr[0].strip() not in self._classes):
                 #print('replacing {:s} with dont care'.format(label_arr[0]))
                 label_arr[0] = 'dontcare'
+                if(label_arr[0].strip() == 'Pedestrian'):
+                    continue
+                if(label_arr[0].strip() == 'Cyclist'):
+                    continue
             if('dontcare' not in label_arr[0].lower().strip()):
                 #print(label_arr)
                 cls = self._class_to_ind[label_arr[0].strip()]

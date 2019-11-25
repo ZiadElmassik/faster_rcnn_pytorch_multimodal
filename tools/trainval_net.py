@@ -107,7 +107,7 @@ if __name__ == '__main__':
         args.net = 'res101'
         args.imdb_name = 'Kitti'
         args.out_dir = 'output/'
-        args.imdb_root_dir = '/home/mat/Thesis/data/Kitti/'
+        args.imdb_root_dir = '/home/mat/thesis/data/Kitti/'
         args.weight = os.path.join(args.imdb_root_dir, 'weights', 'resnet101-caffe.pth')
         #args.weight = os.path.join(args.imdb_root_dir, 'weights/res101_faster_rcnn_iter_110000.pth')
         #args.weight = os.path.join(args.imdb_root_dir, 'weights', 'vgg16-397923af.pth')
