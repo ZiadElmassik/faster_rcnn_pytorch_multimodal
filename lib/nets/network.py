@@ -59,6 +59,7 @@ class Network(nn.Module):
         self._cum_losses['loss_box']          = 0
         self._cum_gt_entries                  = 0
         self._batch_gt_entries                = 0
+        self._cum_im_entries                  = 0
         #Set on every forward pass for use with proposal target layer
         self._gt_boxes = None
         self._gt_boxes_dc = None
@@ -262,9 +263,10 @@ class Network(nn.Module):
         #print('RPN result')
         #print(rpn)
         self._act_summaries['rpn'] = rpn
-
+        dropout_layer = nn.Dropout(0.2)
+        rpn_d = dropout_layer(rpn)
         rpn_cls_score = self.rpn_cls_score_net(
-            rpn)  # batch * (num_anchors * 2) * h * w
+            rpn_d)  # batch * (num_anchors * 2) * h * w
         #print(rpn_cls_score.size())
         # change it so that the score has 2 as its channel size for softmax
         rpn_cls_score_reshape = rpn_cls_score.view(
@@ -310,8 +312,8 @@ class Network(nn.Module):
 
         return rois
 
-    def _region_classification(self, fc7):
-        cls_score = self.cls_score_net(fc7)
+    def _region_classification(self, fc7_dropout, fc7):
+        cls_score = self.cls_score_net(fc7_dropout)
         cls_pred = torch.max(cls_score, 1)[1]
         cls_prob = F.softmax(cls_score, dim=1)
         bbox_pred = self.bbox_pred_net(fc7)
@@ -357,8 +359,7 @@ class Network(nn.Module):
         self.rpn_net = nn.Conv2d(
             self._net_conv_channels, cfg.RPN_CHANNELS, [3, 3], padding=1)
 
-        self.rpn_cls_score_net = nn.Conv2d(cfg.RPN_CHANNELS,
-                                           self._num_anchors * 2, [1, 1])
+        self.rpn_cls_score_net = nn.Conv2d(cfg.RPN_CHANNELS, self._num_anchors * 2, [1, 1])
 
         self.rpn_bbox_pred_net = nn.Conv2d(cfg.RPN_CHANNELS,
                                            self._num_anchors * 4, [1, 1])
@@ -424,20 +425,21 @@ class Network(nn.Module):
             pool5 = self._roi_align_layer(net_conv, rois)
         else:
             pool5 = self._roi_pool_layer(net_conv, rois)
-
+        del net_conv
         if self._mode == 'TRAIN':
             #Find best algo
             torch.backends.cudnn.benchmark = True  # benchmark because now the input size are fixed
         fc7 = self._head_to_tail(pool5)
-
-        cls_prob, bbox_pred = self._region_classification(fc7)
+        head_dropout_layer = nn.Dropout(0.3)
+        fc7_d = head_dropout_layer(fc7)
+        cls_prob, bbox_pred = self._region_classification(fc7_d,fc7)
 
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
 
         return cls_prob, bbox_pred
 
-    def forward(self, image, im_info, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
+    def forward(self, image, im_info=None, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
         self._image_gt_summaries['image'] = image
         self._image_gt_summaries['gt_boxes'] = gt_boxes
         self._image_gt_summaries['gt_boxes_dc'] = gt_boxes_dc
@@ -462,6 +464,8 @@ class Network(nn.Module):
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             #Batch Norm?
             self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
+            del stds
+            del means
         elif(mode == 'VAL'):
             self._add_losses()
             #????
@@ -469,9 +473,11 @@ class Network(nn.Module):
             stds = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
-                self._num_classes).unsqueeze(0).expand_as(bbox_pred)
+               self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             #Batch Norm?
             self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
+            del stds
+            del means
         else:
             self._add_losses()  # compute losses
 
@@ -487,7 +493,7 @@ class Network(nn.Module):
             else:
                 m.weight.data.normal_(mean, stddev)
             m.bias.data.zero_()
-
+        
         normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.rpn_cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
@@ -522,22 +528,25 @@ class Network(nn.Module):
                 del d[k]
                 
     #Eval summary required
-    def run_eval(self, blobs, sum_size):
+    def run_eval(self, blobs, sum_size, update_summaries=False):
         #Flip between eval and train mode -> gradient doesnt accumulate?
         self.eval() # model.eval() will notify all your layers that you are in eval mode, that way, batchnorm or dropout layers will work in eval mode instead of training mode.
-        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
+        with torch.no_grad():
+            self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
         self.train()
-        bbox_predictions = self._predictions['bbox_pred'].data.cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
-        cls_prob         = self._predictions['cls_prob'].data.cpu().numpy() #(self._fc7_channels, self._num_classes)
-        rois             = self._predictions['rois'].data.cpu().numpy()
-        roi_labels       = self._proposal_targets['labels'].data.cpu().numpy()
+        summary = None
+        bbox_predictions = self._predictions['bbox_pred'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
+        cls_prob         = self._predictions['cls_prob'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes)
+        rois             = self._predictions['rois'].data.detach().cpu().numpy()
+        roi_labels       = self._proposal_targets['labels'].data.detach().cpu().numpy()
         #For tensorboard
         for k in self._losses.keys():
             if(k in self._val_event_summaries):
                 self._val_event_summaries[k] += self._losses[k]
             else:
                 self._val_event_summaries[k] = self._losses[k]
-        summary = self._run_summary_op(True,len(blobs['gt_boxes']))
+        if(update_summaries is True):
+            summary = self._run_summary_op(True,sum_size)
         self.delete_intermediate_states()
         return summary, rois, roi_labels, bbox_predictions, cls_prob
 
@@ -562,6 +571,20 @@ class Network(nn.Module):
         if(update_weights):
             #print('updating weights to end batch')
             #print(self._cum_losses['total_loss'])
+
+            #normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            #normal_init(self.rpn_cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            #normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            #normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            #normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
+            #TODO: Make type independent
+            #torch.nn.utils.clip_grad_norm_(self.resnet.parameters(), 0.1)
+            #torch.nn.utils.clip_grad_norm_(self.rpn_net.parameters(), 0.5)
+            #torch.nn.utils.clip_grad_norm_(self.rpn_cls_score_net.parameters(), 0.5)
+            #torch.nn.utils.clip_grad_norm_(self.rpn_bbox_pred_net.parameters(), 0.5)
+            #torch.nn.utils.clip_grad_norm_(self.cls_score_net.parameters(), 0.5)
+            #torch.nn.utils.clip_grad_norm_(self.bbox_pred_net.parameters(), 0.5)
+            #torch.nn.utils.clip_grad_norm_(self.parameters(),0.01)
             train_op.step()
             train_op.zero_grad()
             for k in self._cum_losses.keys():
@@ -570,22 +593,22 @@ class Network(nn.Module):
                 else:
                     self._event_summaries[k] = self._cum_losses[k]
             self._cum_gt_entries                  += self._batch_gt_entries
-            #print('num GT boxes')
-            #print(self._cum_gt_entries)
             self._cum_losses['total_loss']        = 0
             self._cum_losses['rpn_cross_entropy'] = 0
             self._cum_losses['rpn_loss_box']      = 0
             self._cum_losses['cross_entropy']     = 0
             self._cum_losses['loss_box']          = 0
             self._batch_gt_entries                = 0
+        self._cum_im_entries                     += 1
         self.delete_intermediate_states()
 
         return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss
 
     def train_step_with_summary(self, blobs, train_op, sum_size, update_weights=False):
         rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self.train_step(blobs, train_op, update_weights)
-        summary = self._run_summary_op(False, self._cum_gt_entries)
+        summary = self._run_summary_op(False, self._cum_im_entries)
         self._cum_gt_entries = 0
+        self._cum_im_entries = 0
         return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, summary
 
     def train_step_no_return(self, blobs, train_op):
