@@ -26,8 +26,27 @@ import os
 import sys
 import glob
 import time
+import signal
 import gc
-from torch.multiprocessing import Pool, Process, Queue
+from torch.multiprocessing import Pool, Process, Queue, Pipe, set_start_method, Manager
+
+class GracefulKiller:
+  kill_now = False
+  orig_sigint = None
+  orig_sigterm = None
+  def __init__(self):
+    self.orig_sigint = signal.getsignal(signal.SIGINT)
+    self.orig_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, self.exit_gracefully)
+    signal.signal(signal.SIGTERM, self.exit_gracefully)
+
+  def exit_gracefully(self,signum, frame):
+    print('caught sigint/sigterm')
+    signal.signal(signal.SIGINT, self.orig_sigint)
+    signal.signal(signal.SIGTERM, self.orig_sigterm)
+    self.kill_now = True
+
+
 #TODO: Could use original imwidth/imheight
 def compute_bbox(rois, cls_score, bbox_pred, imheight, imwidth, imscale, num_classes,thresh=0.1):
     #print('validation img properties h: {} w: {} s: {} '.format(imheight,imwidth,imscale))
@@ -68,6 +87,47 @@ def scale_lr(optimizer, scale):
     for param_group in optimizer.param_groups:
         param_group['lr'] *= scale
 
+def val_proc(blobs,update_summaries,net,optimizer,val_batch_size):
+    return_dict = {}
+    return_dict['blobs_val'] = blobs
+    return_dict['summary_val'], return_dict['rois_val'], return_dict['roi_labels_val'], return_dict['bbox_pred_val'], return_dict['cls_prob_val']= \
+        net.run_eval(blobs, val_batch_size, update_summaries)
+    return return_dict
+
+def train_sum_proc(blobs,update_weights,net,optimizer,sum_size,mgr_return_dict):
+    print('starting proc {}: '.format('train_sum_proc'))
+    print('from {}: imagename: {}'.format('train_sum_proc',blobs['imagefile']))
+    return_dict = {}
+    return_dict['rpn_loss_cls'], return_dict['rpn_loss_box'], return_dict['loss_cls'], return_dict['loss_box'], return_dict['total_loss'], return_dict['summary'] = \
+        net.train_step_with_summary(blobs, optimizer, sum_size, update_weights)
+    return return_dict
+
+def train_proc(blobs,update_weights,net,optimizer):
+    print('starting proc {}: '.format('train_proc'))
+    print('from {}: imagename: {}'.format('train_proc',blobs['imagefile']))
+    return_dict = {}
+    return_dict['rpn_loss_cls'], return_dict['rpn_loss_box'], return_dict['loss_cls'], return_dict['loss_box'], return_dict['total_loss'] = \
+        net.train_step(blobs, optimizer, update_weights)
+    return return_dict
+
+def val_data_load_proc(data_layer_val,val_augment_en):
+    print('starting proc {}: '.format('val_data_load_proc'))
+    load_t = utils.timer.timer
+    load_t.tic()
+    blobs = data_layer_val.forward(val_augment_en)
+    print('from {}: imagename: {}'.format('val_data_load_proc',blobs['imagefile']))
+    print('validation data load time {}'.format(load_t.toc()))
+    return blobs
+
+def data_load_proc(data_layer,augment_en):
+    print('starting proc {}: '.format('data_load_proc'))
+    load_t = utils.timer.timer
+    load_t.tic()
+    blobs = data_layer.forward(augment_en)
+    print('from {}: imagename: {}'.format('data_load_proc',blobs['imagefile']))
+    print('data load time {}'.format(load_t.toc()))
+    return blobs
+
 class SolverWrapper(object):
     """
     A wrapper class for the training process
@@ -86,25 +146,29 @@ class SolverWrapper(object):
                  batch_size,
                  val_im_thresh,
                  pretrained_model=None):
-        self.net = network
-        self.imdb = imdb
-        self.roidb = roidb
-        self.val_roidb = val_roidb
-        self.output_dir = output_dir
-        self.tbdir = tbdir
-        self.sum_size = sum_size
-        self.val_sum_size = val_sum_size
-        self.epoch_size = epoch_size
-        self.batch_size = batch_size
+        self.net            = network
+        self.imdb           = imdb
+        self.roidb          = roidb
+        self.val_roidb      = val_roidb
+        self.output_dir     = output_dir
+        self.tbdir          = tbdir
+        self.sum_size       = sum_size
+        self.val_sum_size   = val_sum_size
+        self.epoch_size     = epoch_size
+        self.batch_size     = batch_size
         self.val_batch_size = batch_size
         self.val_augment_en = False
         self.augment_en     = True
-        self.val_im_thresh = val_im_thresh
+        self.val_im_thresh  = val_im_thresh
         # Simply put '_val' at the end to save the summaries from the validation set
-        self.tbvaldir = tbdir + '_val'
+        self.tbvaldir       = tbdir + '_val'
         if not os.path.exists(self.tbvaldir):
             os.makedirs(self.tbvaldir)
         self.pretrained_model = pretrained_model
+        try:
+            set_start_method('spawn')
+        except (self.RunTimeError):
+            pass
 
     def snapshot(self, iter):
         net = self.net
@@ -291,12 +355,13 @@ class SolverWrapper(object):
 
     def train_model(self, max_iters):
         # Build data layers for both training and validation set
-        update_weights = False
-        val_augment_en = False
-        augment_en     = True
-        val_batch_size = self.batch_size
+        update_weights   = False
+        update_summaries = False
+        val_augment_en   = False
+        augment_en       = True
+        val_batch_size   = self.batch_size
         self.data_layer = RoIDataLayer(self.roidb, self.imdb.num_classes, 'train')
-        self.data_layer_val = RoIDataLayer(self.val_roidb, self.imdb.num_classes, 'val', random=True)       
+        self.data_layer_val = RoIDataLayer(self.val_roidb, self.imdb.num_classes, 'val', random=True)     
         # Construct the computation graph
         lr, train_op = self.construct_graph()
 
@@ -325,24 +390,29 @@ class SolverWrapper(object):
         #self.net.eval()
         #dummy_input = torch.randn(1, 3, 1920, 730, device='cuda')
         #torch.onnx.export(self.net, dummy_input, '{}.onnx'.format(self.imdb.name), verbose=True)
-# Providing input and output names sets the display names for values
-# within the model's graph. Setting these does not change the semantics
-# of the graph; it is only for readability.
-#
-# The inputs to the network consist of the flat list of inputs (i.e.
-# the values you would pass to the forward() method) followed by the
-# flat list of parameters. You can partially specify names, i.e. provide
-# a list here shorter than the number of inputs to the model, and we will
-# only set that subset of names, starting from the beginning.
-        t = utils.timer.timer
-        loss_cumsum = 0
+        # Providing input and output names sets the display names for values
+        # within the model's graph. Setting these does not change the semantics
+        # of the graph; it is only for readability.
+        #
+        # The inputs to the network consist of the flat list of inputs (i.e.
+        # the values you would pass to the forward() method) followed by the
+        # flat list of parameters. You can partially specify names, i.e. provide
+        # a list here shorter than the number of inputs to the model, and we will
+        # only set that subset of names, starting from the beginning.
+        t                  = utils.timer.timer
+        train_pool         = Pool()
+        loss_cumsum        = 0
         if(iter < 10):
             self.imdb.delete_eval_draw_folder('val','trainval')
         #    scale_lr(self.optimizer,0.1)
-
-        while iter < max_iters + 1:
+        #Preload
+        d_load             = train_pool.apply_async(data_load_proc, args=((self.data_layer),(self.augment_en),))
+        blobs              = d_load.get()
+        killer = GracefulKiller()
+        while iter < max_iters + 1 and not killer.kill_now:
             #print('iteration # {}'.format(iter))
             # Learning rate
+            jobs = []
             if iter % self.batch_size == 0 and iter != 0:
                 update_weights = True
             else:
@@ -359,16 +429,27 @@ class SolverWrapper(object):
                 #print('bumping learning rate back up')
                 #scale_lr(self.optimizer,10)
             t.tic()
-            # Get training data, one batch at a time
-            blobs = self.data_layer.forward(augment_en)
+            #blobs = self.data_layer.forward(augment_en)
             now = time.time()
-
+            #prefetch manually
+            # Get training data, one batch at a time
+            #no need to load on last cycle
+            if(iter < max_iters):
+                d_load             = train_pool.apply_async(data_load_proc, args=((self.data_layer),(self.augment_en),))
             #if iter == 1  or now - last_summary_time > cfg.TRAIN.SUMMARY_INTERVAL:
             if iter % self.val_sum_size == 0:
                 #print('performing summary at iteration: {:d}'.format(iter))
                 # Compute the graph with summary
-                rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss, summary = \
-                  self.net.train_step_with_summary(blobs, self.optimizer, self.val_sum_size, update_weights)
+                p_train_sum        = train_pool.apply_async(train_sum_proc, args=((blobs),(update_weights),(self.net),(self.optimizer),(self.sum_size),))
+                p_train_sum_return = p_train_sum.get()
+                blobs              = d_load.get()
+
+                rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss, summary = p_train_sum_return['rpn_loss_cls'], \
+                                                                                        p_train_sum_return['rpn_loss_box'], \
+                                                                                        p_train_sum_return['loss_cls'],     \
+                                                                                        p_train_sum_return['loss_box'], \
+                                                                                        p_train_sum_return['total_loss'], \
+                                                                                        p_train_sum_return['summary']
                 loss_cumsum += total_loss
                 for _sum in summary:
                     #print('summary')
@@ -376,31 +457,46 @@ class SolverWrapper(object):
                     self.writer.add_summary(_sum, float(iter))
                 # Also check the summary on the validation set (single image)
                 update_summaries = False
+                #Preload first value
+                val_pool = Pool()
+                d_load_val             = val_pool.apply_async(data_load_proc, args=((self.data_layer_val),(self.val_augment_en),))
+                blobs_val              = d_load_val.get()
                 for i in range(val_batch_size):
-                    blobs_val = self.data_layer_val.forward(val_augment_en)
                     if(i == val_batch_size - 1):
                         update_summaries = True
-                    summary_val, rois_val, roi_labels_val, bbox_pred_val, cls_prob_val = self.net.run_eval(blobs_val, val_batch_size, update_summaries)
+                    
+                    d_load_val         = val_pool.apply_async(data_load_proc, args=((self.data_layer_val),(self.val_augment_en),))
+                    p_val              = train_pool.apply_async(val_proc, args=((blobs_val),(update_summaries),(self.net),(self.optimizer),(self.val_batch_size),))
+                    p_val_return       = p_val.get()
+                    blobs_val          = d_load_val.get()
+                    #Dont preload data on last iteration
+                    #if(i != val_batch_size-1):
+                    summary_val, rois_val, roi_labels_val, bbox_pred_val, cls_prob_val, blobs_val = p_val_return['summary_val'], \
+                                                                                                    p_val_return['rois_val'],     \
+                                                                                                    p_val_return['roi_labels_val'], \
+                                                                                                    p_val_return['bbox_pred_val'], \
+                                                                                                    p_val_return['cls_prob_val'], \
+                                                                                                    p_val_return['blobs_val']
                     #im info 0 -> H 1 -> W 2 -> scale
                     #Add ability to do compute_bbox on rois_val and pass to draw&save
                     rois_val, bbox_pred_val = compute_bbox(rois_val,cls_prob_val,bbox_pred_val,blobs_val['im_info'][0],blobs_val['im_info'][1],blobs_val['im_info'][2], self.imdb.num_classes,self.val_im_thresh)
                     self.imdb.draw_and_save_eval(blobs_val['imagefile'],rois_val,roi_labels_val,bbox_pred_val,iter+i,'trainval')
-
-                    #for obj in gc.get_objects():
-                    #    try:
-                    #        if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
-                    #            print(type(obj), obj.size())
-                    #    except:
-                    #        pass
                 #Need to add AP calculation here
                 for _sum in summary_val:
                     self.valwriter.add_summary(_sum, float(iter))
                 last_summary_time = now
             elif iter % self.sum_size == 0:
-                #print('performing summary at iteration: {:d}'.format(iter))
                 # Compute the graph with summary
-                rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss, summary = \
-                  self.net.train_step_with_summary(blobs, self.optimizer, self.sum_size, update_weights)
+                p_train_sum_return     = {}
+                p_train_sum            = train_pool.apply_async(train_sum_proc, args=((blobs),(update_weights),(self.net),(self.optimizer),(self.sum_size),))
+                p_train_sum_return     = p_train_sum.get()
+                blobs                  = d_load.get()
+                rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss, summary = p_train_sum_return['rpn_loss_cls'], \
+                                                                                        p_train_sum_return['rpn_loss_box'], \
+                                                                                        p_train_sum_return['loss_cls'],     \
+                                                                                        p_train_sum_return['loss_box'], \
+                                                                                        p_train_sum_return['total_loss'], \
+                                                                                        p_train_sum_return['summary']
                 loss_cumsum += total_loss
                 for _sum in summary:
                     #print('summary')
@@ -419,8 +515,15 @@ class SolverWrapper(object):
                     #This solution was not used as more difficult to implement. The RoI pooling is made differentiable w.r.t the box coordinates using a RoI warping layer.
                 #4-Step Alternating training: 
                     #The strategy chosen takes 4 steps: In the first of one the RPN is trained. In the second, Fast-RCNN is trained using pre-computed RPN proposals. For the third step, the trained Fast-RCNN is used to initialize a new RPN where only RPN’s layers are fine-tuned. Finally in the fourth step RPN’s layers are frozen and only Fast-RCNN is fine-tuned.
-                rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss = \
-                  self.net.train_step(blobs, self.optimizer, update_weights)
+                p_train_return     = {}
+                p_train            = train_pool.apply_async(train_proc, args=((blobs),(update_weights),(self.net),(self.optimizer),))
+                p_train_return     = p_train.get()
+                blobs              = d_load.get()
+                rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss = p_train_return['rpn_loss_cls'], \
+                                                                                p_train_return['rpn_loss_box'], \
+                                                                                p_train_return['loss_cls'],     \
+                                                                                p_train_return['loss_box'], \
+                                                                                p_train_return['total_loss']
                 loss_cumsum += total_loss
             t.toc()
 
@@ -448,42 +551,14 @@ class SolverWrapper(object):
                 if len(np_paths) > cfg.TRAIN.SNAPSHOT_KEPT:
                     self.remove_snapshot(np_paths, ss_paths)
             iter += 1
-
+        if(killer.kill_now):
+            print('exiting gracefully')
+            sys.exit()
         if last_snapshot_iter != iter - 1:
             self.snapshot(iter - 1)
 
         self.writer.close()
         self.valwriter.close()
-
-def train_proc(self,iter,queue,val_queue):
-    blobs = queue.get()
-    if iter % self.val_sum_size == 0:
-        # Compute the graph with summary
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss, summary = \
-            self.net.train_step_with_summary(blobs, self.optimizer, self.val_sum_size, update_weights)
-        for i in range(self.val_batch_size):
-            blobs_val = val_queue.get()
-            summary_val, rois_val, roi_labels_val, bbox_pred_val, cls_prob_val = self.net.run_eval(blobs_val, self.val_batch_size, update_summaries)
-        last_summary_time = now
-    elif iter % self.sum_size == 0:
-        #print('performing summary at iteration: {:d}'.format(iter))
-        # Compute the graph with summary
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss, summary = \
-            self.net.train_step_with_summary(blobs, self.optimizer, self.sum_size, update_weights)
-    else:
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, total_loss = \
-            self.net.train_step(blobs, self.optimizer, update_weights)
-
-
-def data_load_proc(self,iter,queue,val_queue):
-    blobs = self.data_layer.forward(self.augment_en)
-    now = time.time()
-    utils.timer.timer.tic()
-    if(iter%self.val_sum_size == 0):
-        for i in range(self.val_batch_size):
-            val_queue.put(self.data_layer_val.forward(self.val_augment_en))
-    utils.timer.timer.toc()
-    utils.timer.timer.average_time()
 
 
 def filter_roidb(roidb):

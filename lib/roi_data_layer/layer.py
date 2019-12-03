@@ -67,13 +67,13 @@ class RoIDataLayer(object):
         minibatch = None
         while (minibatch is None):
             db_inds = self._get_next_minibatch_inds()
+            print(db_inds)
             minibatch_db = [self._roidb[i] for i in db_inds]
             #print('minibatch')
             #print(minibatch_db)
             minibatch = get_minibatch(minibatch_db, self._num_classes, augment_en)
             if(minibatch is None):
                 print('skipping image, augmentation resulted in 0 GT boxes')
-        #TODO: if minibatch is empty due to shift/zoom, get another image
         return minibatch
 
     def forward(self,augment_en):
