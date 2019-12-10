@@ -66,10 +66,14 @@ class Network(nn.Module):
 
     def _add_gt_image(self):
         # add back mean
-        image = self._image_gt_summaries['image'] + cfg.PIXEL_MEANS
+        image = ((self._image_gt_summaries['image']))*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
         image = imresize(image[0], self._im_info[:2] / self._im_info[2])
         # BGR to RGB (opencv uses BGR)
-        self._gt_image = image[np.newaxis, :, :, ::-1].copy(order='C')
+        #print(image)
+        #image = image[:,:,:,cfg.PIXEL_ARRANGE]
+        self._gt_image = image[np.newaxis, :, :, cfg.PIXEL_ARRANGE_BGR].copy(order='C')
+        #print(self._gt_image.shape)
+        #self._gt_image = image[np.newaxis, :, :, :].copy(order='C')
 
     def _add_gt_image_summary(self):
         # use a customized visualization function to visualize the boxes
@@ -263,7 +267,7 @@ class Network(nn.Module):
         #print('RPN result')
         #print(rpn)
         self._act_summaries['rpn'] = rpn
-        dropout_layer = nn.Dropout(0.2)
+        dropout_layer = nn.Dropout(0.1)
         rpn_d = dropout_layer(rpn)
         rpn_cls_score = self.rpn_cls_score_net(
             rpn_d)  # batch * (num_anchors * 2) * h * w
@@ -284,7 +288,7 @@ class Network(nn.Module):
             0, 2, 3, 1).contiguous()  # batch * (num_anchors*h) * w * 2
         rpn_cls_pred = torch.max(rpn_cls_score_reshape.view(-1, 2), 1)[1]
 
-        rpn_bbox_pred = self.rpn_bbox_pred_net(rpn)
+        rpn_bbox_pred = self.rpn_bbox_pred_net(rpn_d)
         rpn_bbox_pred = rpn_bbox_pred.permute(
             0, 2, 3, 1).contiguous()  # batch * h * w * (num_anchors*4)
 
@@ -429,10 +433,12 @@ class Network(nn.Module):
         if self._mode == 'TRAIN':
             #Find best algo
             torch.backends.cudnn.benchmark = True  # benchmark because now the input size are fixed
+        #pool_dropout = nn.Dropout(0.4)
+        #pool5_d = pool_dropout(pool5)
         fc7 = self._head_to_tail(pool5)
-        head_dropout_layer = nn.Dropout(0.3)
-        fc7_d = head_dropout_layer(fc7)
-        cls_prob, bbox_pred = self._region_classification(fc7_d,fc7)
+        #head_dropout_layer = nn.Dropout(0.4)
+        #fc7_d = head_dropout_layer(fc7)
+        cls_prob, bbox_pred = self._region_classification(fc7,fc7)
 
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
@@ -464,8 +470,6 @@ class Network(nn.Module):
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             #Batch Norm?
             self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
-            del stds
-            del means
         elif(mode == 'VAL'):
             self._add_losses()
             #????
@@ -476,8 +480,6 @@ class Network(nn.Module):
                self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             #Batch Norm?
             self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
-            del stds
-            del means
         else:
             self._add_losses()  # compute losses
 
@@ -599,6 +601,7 @@ class Network(nn.Module):
             self._cum_losses['cross_entropy']     = 0
             self._cum_losses['loss_box']          = 0
             self._batch_gt_entries                = 0
+        #Should actually be divided by batch size, but whatever
         self._cum_im_entries                     += 1
         self.delete_intermediate_states()
 
