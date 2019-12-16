@@ -16,6 +16,8 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 import numpy
 import sys
+from PIL import Image, ImageDraw
+import os
 
 import utils.timer
 
@@ -50,6 +52,7 @@ class Network(nn.Module):
         self._val_event_summaries = {}
         self._event_summaries = {}
         self._image_gt_summaries = {}
+        self._cnt = 0
         self._variables_to_fix = {}
         self._device = 'cuda'
         self._cum_losses['total_loss']        = 0
@@ -259,6 +262,14 @@ class Network(nn.Module):
         loss = cross_entropy + loss_box + rpn_cross_entropy + rpn_loss_box
         self._losses['total_loss'] = loss
         #print('individual image loss:{:f}'.format(loss))
+        #if(loss > 1):
+        #    torch.set_printoptions(profile="full")
+        #    print('loss {}'.format(loss))
+            #print('labels: {}'.format(label))
+            #print('class score: {}'.format(cls_score))
+            #print('bbox targets: {}'.format(bbox_targets))
+            #print('bbox pred: {}'.format(bbox_pred))
+        #    torch.set_printoptions(profile="default")
         return loss
 
     def _region_proposal(self, net_conv):
@@ -270,7 +281,7 @@ class Network(nn.Module):
         dropout_layer = nn.Dropout(0.1)
         rpn_d = dropout_layer(rpn)
         rpn_cls_score = self.rpn_cls_score_net(
-            rpn_d)  # batch * (num_anchors * 2) * h * w
+            rpn)  # batch * (num_anchors * 2) * h * w
         #print(rpn_cls_score.size())
         # change it so that the score has 2 as its channel size for softmax
         rpn_cls_score_reshape = rpn_cls_score.view(
@@ -288,7 +299,7 @@ class Network(nn.Module):
             0, 2, 3, 1).contiguous()  # batch * (num_anchors*h) * w * 2
         rpn_cls_pred = torch.max(rpn_cls_score_reshape.view(-1, 2), 1)[1]
 
-        rpn_bbox_pred = self.rpn_bbox_pred_net(rpn_d)
+        rpn_bbox_pred = self.rpn_bbox_pred_net(rpn)
         rpn_bbox_pred = rpn_bbox_pred.permute(
             0, 2, 3, 1).contiguous()  # batch * h * w * (num_anchors*4)
 
@@ -317,7 +328,8 @@ class Network(nn.Module):
         return rois
 
     def _region_classification(self, fc7_dropout, fc7):
-        cls_score = self.cls_score_net(fc7_dropout)
+        fc8       = self.fc8(fc7_dropout)
+        cls_score = self.cls_score_net(fc7)
         cls_pred = torch.max(cls_score, 1)[1]
         cls_prob = F.softmax(cls_score, dim=1)
         bbox_pred = self.bbox_pred_net(fc7)
@@ -362,7 +374,7 @@ class Network(nn.Module):
         # rpn
         self.rpn_net = nn.Conv2d(
             self._net_conv_channels, cfg.RPN_CHANNELS, [3, 3], padding=1)
-
+        self.fc8               = nn.Linear(self._fc7_channels,self._fc7_channels)
         self.rpn_cls_score_net = nn.Conv2d(cfg.RPN_CHANNELS, self._num_anchors * 2, [1, 1])
 
         self.rpn_bbox_pred_net = nn.Conv2d(cfg.RPN_CHANNELS,
@@ -410,6 +422,20 @@ class Network(nn.Module):
 
         return summaries
 
+    def _draw_and_save(self,im,gt_boxes):
+        datapath = os.path.join(cfg.DATA_DIR, 'waymo','debug')
+        out_file = os.path.join(datapath,'{}.png'.format(self._cnt))
+        im = (im + cfg.PIXEL_MEANS)*cfg.PIXEL_STDDEVS
+        im = im.astype('uint8')[0,:,:,:]
+        print(im.shape)
+        source_img = Image.fromarray(im)
+        draw = ImageDraw.Draw(source_img)
+        for det in gt_boxes:
+            draw.rectangle([(det[0],det[1]),(det[2],det[3])],outline=(0,0,0))
+        print('Saving file at location {}'.format(out_file))
+        source_img.save(out_file,'PNG')  
+        self._cnt += 1
+
     def _predict(self):
         # This is just _build_network in tf-faster-rcnn
         torch.backends.cudnn.benchmark = False
@@ -436,9 +462,9 @@ class Network(nn.Module):
         #pool_dropout = nn.Dropout(0.4)
         #pool5_d = pool_dropout(pool5)
         fc7 = self._head_to_tail(pool5)
-        #head_dropout_layer = nn.Dropout(0.4)
-        #fc7_d = head_dropout_layer(fc7)
-        cls_prob, bbox_pred = self._region_classification(fc7,fc7)
+        head_dropout_layer = nn.Dropout(0.4)
+        fc7_d = head_dropout_layer(fc7)
+        cls_prob, bbox_pred = self._region_classification(fc7_d,fc7)
 
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
@@ -462,6 +488,7 @@ class Network(nn.Module):
             self._mode = 'TRAIN'
 
         cls_prob, bbox_pred = self._predict()
+        total_loss = 0
         if mode == 'TEST':
             #These are the deltas and they come out of the NN normalized, need to undo this
             stds = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(
@@ -481,7 +508,9 @@ class Network(nn.Module):
             #Batch Norm?
             self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
         else:
-            self._add_losses()  # compute losses
+            total_loss = self._add_losses()  # compute losses
+        #if(total_loss > 1):
+        #    self._draw_and_save(image,gt_boxes)
 
     def init_weights(self):
         def normal_init(m, mean, stddev, truncated=False):
