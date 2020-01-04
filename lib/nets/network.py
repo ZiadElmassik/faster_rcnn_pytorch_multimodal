@@ -608,14 +608,8 @@ class Network(nn.Module):
             #normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
             #normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
             #normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
-            #TODO: Make type independent
-            #torch.nn.utils.clip_grad_norm_(self.resnet.parameters(), 0.1)
-            #torch.nn.utils.clip_grad_norm_(self.rpn_net.parameters(), 0.5)
-            #torch.nn.utils.clip_grad_norm_(self.rpn_cls_score_net.parameters(), 0.5)
-            #torch.nn.utils.clip_grad_norm_(self.rpn_bbox_pred_net.parameters(), 0.5)
-            #torch.nn.utils.clip_grad_norm_(self.cls_score_net.parameters(), 0.5)
-            #torch.nn.utils.clip_grad_norm_(self.bbox_pred_net.parameters(), 0.5)
-            #torch.nn.utils.clip_grad_norm_(self.parameters(),0.01)
+            #Clip gradients
+            torch.nn.utils.clip_grad_norm_([x[1] for x in self.named_parameters()],25)
             train_op.step()
             train_op.zero_grad()
             for k in self._cum_losses.keys():
