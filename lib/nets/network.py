@@ -380,12 +380,16 @@ class Network(nn.Module):
         cls_pred = torch.max(cls_score, 1)[1]
         cls_prob = F.softmax(cls_score, dim=1)
         bbox_pred = self.bbox_pred_net(fc7)
-        bbox_var  = self.bbox_var_net(fc7)
         self._predictions['cls_score'] = cls_score
         self._predictions['cls_pred'] = cls_pred
         self._predictions['cls_prob'] = cls_prob
         self._predictions['bbox_pred'] = bbox_pred
-        self._predictions['bbox_var']  = bbox_var
+        if(cfg.ENABLE_BBOX_VAR):
+            bbox_var  = self.bbox_var_net(fc7)
+            self._predictions['bbox_var']  = bbox_var
+        else:
+            bbox_var = None
+            self._predictions['bbox_var'] = None
         return cls_prob, bbox_pred, bbox_var
 
     def _image_to_head(self):
@@ -429,7 +433,8 @@ class Network(nn.Module):
 
         self.cls_score_net = nn.Linear(self._fc7_channels, self._num_classes)
         self.bbox_pred_net = nn.Linear(self._fc7_channels, self._num_classes * 4)
-        self.bbox_var_net  = nn.Linear(self._fc7_channels, self._num_classes * 4)
+        if(cfg.ENABLE_BBOX_VAR):
+            self.bbox_var_net  = nn.Linear(self._fc7_channels, self._num_classes * 4)
         self.init_weights()
 
     def _run_summary_op(self, val=False, summary_size=1):
@@ -577,7 +582,8 @@ class Network(nn.Module):
         normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
-        normal_init(self.bbox_var_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
+        if(cfg.ENABLE_BBOX_VAR):
+            normal_init(self.bbox_var_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
     # Extract the head feature maps, for example for vgg16 it is conv5_3
     # only useful during testing mode
     def extract_head(self, image):
@@ -590,11 +596,14 @@ class Network(nn.Module):
         self.eval()
         with torch.no_grad():
             self.forward(image, im_info, None, None, mode='TEST')
-        cls_score, cls_prob, bbox_pred, bbox_var, rois = self._predictions["cls_score"].data.cpu().numpy(), \
+        cls_score, cls_prob, bbox_pred, rois = self._predictions["cls_score"].data.cpu().numpy(), \
                                                          self._predictions['cls_prob'].data.cpu().numpy(), \
                                                          self._predictions['bbox_pred'].data.cpu().numpy(), \
-                                                         self._predictions['bbox_var'].data.cpu().numpy(), \
                                                          self._predictions['rois'].data.cpu().numpy()
+        if(cfg.ENABLE_BBOX_VAR):
+            bbox_var = self._predictions['bbox_var'].data.cpu().numpy()
+        else:
+            bbox_var = None
         return cls_score, cls_prob, bbox_pred, bbox_var, rois
 
     def delete_intermediate_states(self):
@@ -615,7 +624,10 @@ class Network(nn.Module):
         self.train()
         summary = None
         bbox_pred        = self._predictions['bbox_pred'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
-        bbox_var_pred    = self._predictions['bbox_var'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
+        if(cfg.ENABLE_BBOX_VAR):
+            bbox_var_pred    = self._predictions['bbox_var'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
+        else:
+            bbox_var_pred = None
         cls_prob         = self._predictions['cls_prob'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes)
         rois             = self._predictions['rois'].data.detach().cpu().numpy()
         roi_labels       = self._proposal_targets['labels'].data.detach().cpu().numpy()
