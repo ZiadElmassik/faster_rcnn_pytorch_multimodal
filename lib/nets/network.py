@@ -274,7 +274,10 @@ class Network(nn.Module):
 
         # RCNN, bbox loss
         bbox_pred = self._predictions['bbox_pred']
-        bbox_var  = self._predictions['bbox_var']
+        if(cfg.ENABLE_BBOX_VAR):
+            bbox_var  = self._predictions['bbox_var']
+        else:
+            bbox_var = None
         #This should read bbox_target_deltas
         bbox_targets = self._proposal_targets['bbox_targets']
         bbox_inside_weights = self._proposal_targets['bbox_inside_weights']
@@ -389,7 +392,6 @@ class Network(nn.Module):
             self._predictions['bbox_var']  = bbox_var
         else:
             bbox_var = None
-            self._predictions['bbox_var'] = None
         return cls_prob, bbox_pred, bbox_var
 
     def _image_to_head(self):
@@ -571,6 +573,7 @@ class Network(nn.Module):
       """
             # x is a parameter
             if truncated:
+                #In-place functions to save GPU mem
                 m.weight.data.normal_().fmod_(2).mul_(stddev).add_(
                     mean)  # not a perfect approximation
             else:
@@ -583,7 +586,7 @@ class Network(nn.Module):
         normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
         if(cfg.ENABLE_BBOX_VAR):
-            normal_init(self.bbox_var_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
+            normal_init(self.bbox_var_net, 0, 0.01, True)
     # Extract the head feature maps, for example for vgg16 it is conv5_3
     # only useful during testing mode
     def extract_head(self, image):
@@ -672,7 +675,7 @@ class Network(nn.Module):
             #normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
             #normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
             #Clip gradients
-            torch.nn.utils.clip_grad_norm_([x[1] for x in self.named_parameters()],15)
+            torch.nn.utils.clip_grad_norm_([x[1] for x in self.named_parameters()],20)
             train_op.step()
             train_op.zero_grad()
             for k in self._cum_losses.keys():
