@@ -61,6 +61,7 @@ class Network(nn.Module):
         self._cum_losses['cross_entropy']     = 0
         self._cum_losses['loss_box']          = 0
         self._cum_losses['avg_bbox_var']      = 0
+        self._cum_losses['avg_cls_var']       = 0
         self._cum_gt_entries                  = 0
         self._batch_gt_entries                = 0
         self._cum_im_entries                  = 0
@@ -207,14 +208,6 @@ class Network(nn.Module):
             #Don't need covariance matrix as it collapses itself in the end anyway
             #eye = torch.eye().repeat(in_var.shape[0])
             #torch.set_printoptions(profile="full")
-            #print('bbox_var')
-            #print(bbox_var)
-            var_exp = torch.pow(bbox_var,2)
-            #print('var_exp')
-            #print(var_exp)
-            var_log = torch.log(var_exp)
-            #print('var_log')
-            #print(var_log)
             #torch.set_printoptions(profile="default")
             in_loss_box = 0.5*in_loss_box*torch.exp(-bbox_var) + 0.5*torch.exp(bbox_var)
             in_loss_box = in_loss_box*bbox_inside_weights
@@ -266,30 +259,35 @@ class Network(nn.Module):
             rpn_bbox_outside_weights,
             sigma=sigma_rpn,
             dim=[1, 2, 3])
-        # RCNN, class loss
-        cls_score = self._predictions["cls_score"]
-        label = self._proposal_targets["labels"].view(-1)
-        cross_entropy = F.cross_entropy(
-            cls_score.view(-1, self._num_classes), label)
+        # RCNN, class loss, performed on class score logits
+        cls_score = self._predictions['cls_score']
+        label = self._proposal_targets['labels'].view(-1)
+        if(cfg.ENABLE_CLS_VAR):
+            cls_var  = self._predictions['cls_var']
+            cross_entropy = self._bayesian_cross_entropy(cls_score.view(-1, self._num_classes), cls_var.view(-1, self._num_classes), label,10)
+            #label = label.unsqueeze(1)
+            #true_cls_var = torch.gather(cls_var,1,label)
+            #avg_cls_entropy = F.cross_entropy(cls_var)
+            self._losses['avg_cls_var'] = torch.mean(cls_var)
+        else:
+            cls_var  = None
+            cross_entropy = F.cross_entropy(
+                cls_score.view(-1, self._num_classes), label)
+            self._losses['avg_cls_var'] = torch.tensor(0)
 
         # RCNN, bbox loss
         bbox_pred = self._predictions['bbox_pred']
-        if(cfg.ENABLE_BBOX_VAR):
-            bbox_var  = self._predictions['bbox_var']
-        else:
-            bbox_var = None
         #This should read bbox_target_deltas
         bbox_targets = self._proposal_targets['bbox_targets']
         bbox_inside_weights = self._proposal_targets['bbox_inside_weights']
         bbox_outside_weights = self._proposal_targets['bbox_outside_weights']
-        loss_box = self._smooth_l1_loss('DET', bbox_pred, bbox_targets, bbox_var, bbox_inside_weights, bbox_outside_weights)
         if(cfg.ENABLE_BBOX_VAR):
-            self._losses['avg_bbox_var'] = (torch.pow(bbox_var,2)*bbox_inside_weights).mean()
-            #self._losses['average_bbox_entropy'] = self._bbox_mean_entropy(bbox_var)
+            bbox_var  = self._predictions['bbox_var']
+            self._losses['avg_bbox_var'] = (torch.exp(bbox_var)*bbox_inside_weights).mean()
         else:
+            bbox_var = None
             self._losses['avg_bbox_var'] = torch.tensor(0)
-        if(cfg.ENABLE_RPN_BBOX_VAR):
-            self._losses['rpn_average_bbox_entropy'] = self._mean_entropy([])
+        loss_box = self._smooth_l1_loss('DET', bbox_pred, bbox_targets, bbox_var, bbox_inside_weights, bbox_outside_weights)
         self._losses['cross_entropy'] = cross_entropy
         self._losses['loss_box'] = loss_box
         self._losses['rpn_cross_entropy'] = rpn_cross_entropy
@@ -307,6 +305,31 @@ class Network(nn.Module):
             #print('bbox pred: {}'.format(bbox_pred))
         #    torch.set_printoptions(profile="default")
         return loss
+
+    def _bayesian_cross_entropy(self,cls_score,cls_var,targets,num_sample):
+        true_var      = torch.gather(cls_var,1,targets.unsqueeze(1)).squeeze(1)
+        undistorted_ce =  F.cross_entropy(cls_score, targets,reduction='none')
+
+        #Distorted loss
+        dist = torch.distributions.Normal(0,torch.sqrt(cls_var))
+        cls_score_resize = cls_score.repeat(num_sample,1,1)
+        samples = dist.sample((num_sample,)) + cls_score_resize
+        #samples = torch.nn.functional.elu(samples) + cls_score
+        samples = samples.permute(0,2,1)
+        targets_resize = targets.repeat(num_sample,1)
+        distorted_ce = F.cross_entropy(samples, targets_resize,reduction='none')
+        ce_noise     = distorted_ce - undistorted_ce.repeat(num_sample,1)
+        ce_elu       = torch.nn.functional.elu(ce_noise)
+        ce_var_loss  = ce_noise + undistorted_ce.repeat(num_sample,1)
+        ce_var_loss  = torch.mean(ce_var_loss,axis=0)
+        #samples = samples.permute(1,2,0)
+        #samples = dist.sample((num_sample,)).permute(1,2,0)
+        #sample_targets = targets.repeat(1,num_sample).view(-1,num_sample)
+        #cross_entropy = F.cross_entropy(samples, sample_targets,reduction='none')
+        regularizer   = torch.var(ce_noise,dim=0)
+        regularizer   = torch.mean(regularizer)
+        ce_loss = 0.5*torch.mean(torch.log(torch.clamp_min(ce_var_loss,0.2))) - 0.5*regularizer
+        return ce_loss
 
     def _bbox_mean_entropy(self, bbox_var):
         bbox_var = bbox_var.sum(0)
@@ -392,7 +415,12 @@ class Network(nn.Module):
             self._predictions['bbox_var']  = bbox_var
         else:
             bbox_var = None
-        return cls_prob, bbox_pred, bbox_var
+        if(cfg.ENABLE_CLS_VAR):
+            cls_var   = self.cls_var_net(fc7)
+            self._predictions['cls_var'] = torch.exp(cls_var)
+        else:
+            cls_var   = None
+        return cls_prob, cls_var, bbox_pred, bbox_var
 
     def _image_to_head(self):
         raise NotImplementedError
@@ -437,6 +465,8 @@ class Network(nn.Module):
         self.bbox_pred_net = nn.Linear(self._fc7_channels, self._num_classes * 4)
         if(cfg.ENABLE_BBOX_VAR):
             self.bbox_var_net  = nn.Linear(self._fc7_channels, self._num_classes * 4)
+        if(cfg.ENABLE_CLS_VAR):
+            self.cls_var_net   = nn.Linear(self._fc7_channels,self._num_classes)
         self.init_weights()
 
     def _run_summary_op(self, val=False, summary_size=1):
@@ -518,12 +548,12 @@ class Network(nn.Module):
         fc7 = self._head_to_tail(pool5)
         head_dropout_layer = nn.Dropout(0.4)
         fc7_d = head_dropout_layer(fc7)
-        cls_prob, bbox_pred, bbox_var = self._region_classification(fc7_d,fc7)
+        cls_prob, cls_var, bbox_pred, bbox_var = self._region_classification(fc7_d,fc7)
 
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
 
-        return cls_prob, bbox_pred, bbox_var
+        return cls_prob, cls_var, bbox_pred, bbox_var
 
     def forward(self, image, im_info=None, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
         self._image_gt_summaries['image'] = image
@@ -541,7 +571,7 @@ class Network(nn.Module):
         if(mode == 'VAL'):
             self._mode = 'TRAIN'
 
-        cls_prob, bbox_pred, bbox_var = self._predict()
+        cls_prob, cls_var, bbox_pred, bbox_var = self._predict()
         total_loss = 0
         if mode == 'TEST':
             #These are the deltas and they come out of the NN normalized, need to undo this
@@ -586,7 +616,9 @@ class Network(nn.Module):
         normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
         if(cfg.ENABLE_BBOX_VAR):
-            normal_init(self.bbox_var_net, 0, 0.01, True)
+            normal_init(self.bbox_var_net, 0, 0.001, True)
+        if(cfg.ENABLE_CLS_VAR):
+            normal_init(self.cls_var_net,0,0.001,cfg.TRAIN.TRUNCATED)
     # Extract the head feature maps, for example for vgg16 it is conv5_3
     # only useful during testing mode
     def extract_head(self, image):
@@ -607,7 +639,11 @@ class Network(nn.Module):
             bbox_var = self._predictions['bbox_var'].data.cpu().numpy()
         else:
             bbox_var = None
-        return cls_score, cls_prob, bbox_pred, bbox_var, rois
+        if(cfg.ENABLE_CLS_VAR):
+            cls_var = self._predictions['cls_var'].data.cpu().numpy()
+        else:
+            cls_var = None
+        return cls_score, cls_prob, cls_var, bbox_pred, bbox_var, rois
 
     def delete_intermediate_states(self):
         # Delete intermediate result to save memory
@@ -625,36 +661,41 @@ class Network(nn.Module):
         with torch.no_grad():
             self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
         self.train()
-        summary = None
-        bbox_pred        = self._predictions['bbox_pred'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
+        summary           = None
+        bbox_pred         = self._predictions['bbox_pred'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
         if(cfg.ENABLE_BBOX_VAR):
-            bbox_var_pred    = self._predictions['bbox_var'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
+            bbox_var_pred = self._predictions['bbox_var'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
         else:
             bbox_var_pred = None
+        if(cfg.ENABLE_CLS_VAR):
+            cls_var = self._predictions['cls_var'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
+        else:
+            cls_var = None
         cls_prob         = self._predictions['cls_prob'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes)
         rois             = self._predictions['rois'].data.detach().cpu().numpy()
         roi_labels       = self._proposal_targets['labels'].data.detach().cpu().numpy()
         #For tensorboard
         for k in self._losses.keys():
             if(k in self._val_event_summaries):
-                self._val_event_summaries[k] += self._losses[k]
+                self._val_event_summaries[k] += self._losses[k].item()
             else:
-                self._val_event_summaries[k] = self._losses[k]
+                self._val_event_summaries[k] = self._losses[k].item()
         if(update_summaries is True):
             summary = self._run_summary_op(True,sum_size)
         self.delete_intermediate_states()
-        return summary, rois, roi_labels, bbox_pred, bbox_var_pred, cls_prob
+        return summary, rois, roi_labels, bbox_pred, bbox_var_pred, cls_prob, cls_var
 
-    def train_step(self, blobs, train_op, update_weights=False):
+    def train_step(self, blobs, train_op, update_weights=False,summary_step=False):
         #Computes losses for single image
         self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
         #.item() converts single element of type pytorch.tensor to a primitive float/int
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, avg_bbox_var = self._losses["rpn_cross_entropy"].item(), \
-                                                                                self._losses['rpn_loss_box'].item(), \
-                                                                                self._losses['cross_entropy'].item(), \
-                                                                                self._losses['loss_box'].item(), \
-                                                                                self._losses['total_loss'].item(), \
-                                                                                self._losses['avg_bbox_var'].item()
+        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, avg_bbox_var, avg_cls_var = self._losses["rpn_cross_entropy"].item(), \
+                                                                                          self._losses['rpn_loss_box'].item(), \
+                                                                                          self._losses['cross_entropy'].item(), \
+                                                                                          self._losses['loss_box'].item(), \
+                                                                                          self._losses['total_loss'].item(), \
+                                                                                          self._losses['avg_bbox_var'].item(), \
+                                                                                          self._losses['avg_cls_var'].item()
         #utils.timer.timer.tic('backward')
         self._losses['total_loss'].backward()
         #utils.timer.timer.toc('backward')
@@ -664,6 +705,7 @@ class Network(nn.Module):
         self._cum_losses['cross_entropy']     += loss_cls
         self._cum_losses['loss_box']          += loss_box
         self._cum_losses['avg_bbox_var']      += avg_bbox_var
+        self._cum_losses['avg_cls_var']       += avg_cls_var
         self._batch_gt_entries                += len(blobs['gt_boxes'])
         if(update_weights):
             #print('updating weights to end batch')
@@ -684,13 +726,15 @@ class Network(nn.Module):
                 else:
                     self._event_summaries[k] = self._cum_losses[k]
             self._cum_gt_entries                  += self._batch_gt_entries
-            self._cum_losses['total_loss']        = 0
-            self._cum_losses['rpn_cross_entropy'] = 0
-            self._cum_losses['rpn_loss_box']      = 0
-            self._cum_losses['cross_entropy']     = 0
-            self._cum_losses['loss_box']          = 0
-            self._cum_losses['avg_bbox_var']      = 0
-            self._batch_gt_entries                = 0
+            if(not summary_step):
+                self._cum_losses['total_loss']        = 0
+                self._cum_losses['rpn_cross_entropy'] = 0
+                self._cum_losses['rpn_loss_box']      = 0
+                self._cum_losses['cross_entropy']     = 0
+                self._cum_losses['loss_box']          = 0
+                self._cum_losses['avg_bbox_var']      = 0
+                self._cum_losses['avg_cls_var']       = 0
+                self._batch_gt_entries                = 0
         #Should actually be divided by batch size, but whatever
         self._cum_im_entries                     += 1
         self.delete_intermediate_states()
@@ -698,8 +742,16 @@ class Network(nn.Module):
         return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss
 
     def train_step_with_summary(self, blobs, train_op, sum_size, update_weights=False):
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self.train_step(blobs, train_op, update_weights)
+        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self.train_step(blobs, train_op, update_weights,summary_step=True)
         summary = self._run_summary_op(False, self._cum_im_entries)
+        self._cum_losses['total_loss']        = 0
+        self._cum_losses['rpn_cross_entropy'] = 0
+        self._cum_losses['rpn_loss_box']      = 0
+        self._cum_losses['cross_entropy']     = 0
+        self._cum_losses['loss_box']          = 0
+        self._cum_losses['avg_bbox_var']      = 0
+        self._cum_losses['avg_cls_var']       = 0
+        self._batch_gt_entries                = 0
         self._cum_gt_entries = 0
         self._cum_im_entries = 0
         return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, summary
