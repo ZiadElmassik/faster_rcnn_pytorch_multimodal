@@ -122,7 +122,9 @@ class Network(nn.Module):
                                          self._feat_stride, self._anchors, self._num_anchors)
         return rois, rpn_scores
 
+    #FYI this is a fancy way of instantiating a class and calling its main function
     def _roi_pool_layer(self, bottom, rois):
+        #Has restriction on batch, only one dim allowed
         return RoIPool((cfg.POOLING_SIZE, cfg.POOLING_SIZE),
                        1.0 / 16.0)(bottom, rois)
 
@@ -353,7 +355,7 @@ class Network(nn.Module):
         #Get expectation over T forward passes
         mutual_info = torch.mean(mutual_info,dim=0)
         mutual_info += total_entropy
-        return mutual_info.clamp_(0.0,1.0)
+        return mutual_info.clamp_min(0.0)
 
     def _bayesian_cross_entropy(self,cls_score,cls_var,targets,num_sample):
         #cls_var comes in as true variance. Network output is log(var) but exp is applied at network output.
@@ -448,33 +450,30 @@ class Network(nn.Module):
         self._num_mc_run = num_mc_run
 
     def _region_classification(self, fc7):
-        fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
+        #fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
         if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
-            cls_drop  = self.cls_dropout(fc7)
-            cls_fc8   = self.cls_post_dropout_fc(cls_drop)
-            cls_score = self.cls_score_net(cls_fc8)
-            self._mc_run_output['cls_score'] = cls_score
+            cls_score_in = self._cls_tail(fc7,True)
         else:
-            cls_score = self.cls_score_net(fc7)
+            cls_score_in = fc7
+        cls_score = self.cls_score_net(cls_score_in)
+        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
+            bbox_pred_in = self._bbox_tail(fc7,True)
+        else:
+            bbox_pred_in = fc7
+        bbox_pred = self.bbox_pred_net(bbox_pred_in)
+
         cls_score_mean = torch.mean(cls_score,dim=0)
         cls_pred = torch.max(cls_score_mean, 1)[1]
         cls_prob = torch.mean(F.softmax(cls_score, dim=2),dim=0)
-        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
-            bbox_drop = self.bbox_dropout(fc7)
-            bbox_fc8  = self.bbox_post_dropout_fc(bbox_drop)
-            bbox_pred = self.bbox_pred_net(bbox_fc8)
-            self._mc_run_output['bbox_pred'] = bbox_pred
-            a_bbox_var_fc = bbox_fc8
-        else:
-            bbox_pred = self.bbox_pred_net(fc7)
-            a_bbox_var_fc = fc7
+        self._mc_run_output['bbox_pred'] = bbox_pred
+        self._mc_run_output['cls_score'] = cls_score
         self._predictions['cls_score'] = cls_score_mean
         self._predictions['cls_pred'] = cls_pred
         self._predictions['cls_prob'] = cls_prob
         #TODO: Make domain shift here
         self._predictions['bbox_pred'] = torch.mean(bbox_pred,dim=0)
         if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            bbox_var  = self.bbox_al_var_net(a_bbox_var_fc)
+            bbox_var  = self.bbox_al_var_net(bbox_pred_in)
             self._predictions['a_bbox_var']  = torch.mean(bbox_var,dim=0)
 
     def _image_to_head(self):
@@ -514,17 +513,26 @@ class Network(nn.Module):
 
         self.rpn_bbox_pred_net = nn.Conv2d(cfg.RPN_CHANNELS,
                                            self._num_anchors * 4, [1, 1])
-
-        self.cls_score_net = nn.Linear(self._fc7_channels, self._num_classes)
-        self.bbox_pred_net = nn.Linear(self._fc7_channels, self._num_classes * 4)
+        if(cfg.ENABLE_CUSTOM_TAIL):
+            self.t_fc1           = nn.Linear(self._roi_pooling_channels,self._fc7_channels*8)
+            self.t_fc2           = nn.Linear(self._fc7_channels*8,self._fc7_channels*4)
+            self.t_fc3           = nn.Linear(self._fc7_channels*4,self._fc7_channels*2)
+        self.cls_score_net       = nn.Linear(int(self._fc7_channels/4), self._num_classes)
+        self.bbox_pred_net       = nn.Linear(int(self._fc7_channels/4), self._num_classes * 4)
         if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
-            self.bbox_dropout         = nn.Dropout(0.5)
-            self.bbox_post_dropout_fc = nn.Linear(self._fc7_channels, self._fc7_channels)
+            self.bbox_fc1        = nn.Linear(self._fc7_channels, self._fc7_channels)
+            self.bbox_fc2        = nn.Linear(self._fc7_channels, int(self._fc7_channels/2))
+            self.bbox_fc3        = nn.Linear(int(self._fc7_channels/2), int(self._fc7_channels/4))
+            #self.bbox_dropout         = nn.Dropout(0.4)
+            #self.bbox_post_dropout_fc = nn.Linear(self._fc7_channels*2, self._fc7_channels)
         if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            self.bbox_al_var_net  = nn.Linear(self._fc7_channels, self._num_classes * 4)
+            self.bbox_al_var_net  = nn.Linear(int(self._fc7_channels/4), self._num_classes * 4)
         if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
-            self.cls_dropout         = nn.Dropout(0.5)
-            self.cls_post_dropout_fc = nn.Linear(self._fc7_channels, self._fc7_channels)
+            self.cls_fc1        = nn.Linear(self._fc7_channels, self._fc7_channels)
+            self.cls_fc2        = nn.Linear(self._fc7_channels, int(self._fc7_channels/2))
+            self.cls_fc3        = nn.Linear(int(self._fc7_channels/2), int(self._fc7_channels/4))
+            #self.cls_dropout         = nn.Dropout(0.4)
+            #self.cls_post_dropout_fc = nn.Linear(self._fc7_channels*2, self._fc7_channels)
         #if(cfg.ENABLE_ALEATORIC_CLS_VAR):
         #    self.cls_var_net   = nn.Linear(self._fc7_channels,self._num_classes)
         self.init_weights()
@@ -606,12 +614,85 @@ class Network(nn.Module):
             torch.backends.cudnn.benchmark = True  # benchmark because now the input size are fixed
         #elif(self._mode == 'TEST'):
         #    self._num_mc_run = 10
-        #pool_dropout = nn.Dropout(0.4)
-        #pool5_d = pool_dropout(pool5)
-        fc7 = self._head_to_tail(pool5)
+        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR or cfg.ENABLE_EPISTEMIC_CLS_VAR):
+            dropout_en = True
+        else:
+            dropout_en = False
+        if(cfg.ENABLE_CUSTOM_TAIL):
+            fc7 = self._custom_tail(pool5,dropout_en)
+        else:
+            fc7 = self._head_to_tail(pool5,dropout_en)
+            fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
+
         self._region_classification(fc7)
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
+
+    def _cls_tail(self,fc7,dropout_en):
+        if(dropout_en):
+            fc_dropout_rate   = 0.5
+        else:
+            fc_dropout_rate   = 0.0
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+        fc1     = self.cls_fc1(fc7)
+        fc1_r   = fc_relu(fc1)
+        fc1_d   = fc_dropout1(fc1_r)
+        fc2     = self.cls_fc2(fc1_d)
+        fc2_r   = fc_relu(fc2)
+        fc2_d   = fc_dropout2(fc2_r)
+        fc3     = self.cls_fc3(fc2_d)
+        fc3_r   = fc_relu(fc3)
+        fc3_d   = fc_dropout2(fc3_r)
+        return fc3_d
+
+    def _bbox_tail(self,fc7,dropout_en):
+        if(dropout_en):
+            fc_dropout_rate   = 0.5
+        else:
+            fc_dropout_rate   = 0.0
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+        fc1     = self.bbox_fc1(fc7)
+        fc1_r   = fc_relu(fc1)
+        fc1_d   = fc_dropout1(fc1_r)
+        fc2     = self.bbox_fc2(fc1_d)
+        fc2_r   = fc_relu(fc2)
+        fc2_d   = fc_dropout2(fc2_r)
+        fc3     = self.bbox_fc3(fc2_d)
+        fc3_r   = fc_relu(fc3)
+        fc3_d   = fc_dropout2(fc3_r)
+        return fc3_d
+
+    def _custom_tail(self,pool5,dropout_en):
+        pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._num_mc_run,1,1)
+        if(dropout_en):
+            conv_dropout_rate = 0.2
+            fc_dropout_rate   = 0.5
+        else:
+            conv_dropout_rate = 0.0
+            fc_dropout_rate   = 0.0
+        pool_dropout = nn.Dropout(conv_dropout_rate)
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_dropout4   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+        pool5_d = pool_dropout(pool5)
+        fc1     = self.t_fc1(pool5_d)
+        fc1_r   = fc_relu(fc1)
+        fc1_d   = fc_dropout1(fc1_r)
+        fc2     = self.t_fc2(fc1_d)
+        fc2_r   = fc_relu(fc2)
+        fc2_d   = fc_dropout2(fc2_r)
+        fc3     = self.t_fc3(fc2_d)
+        fc3_r   = fc_relu(fc3)
+        fc3_d   = fc_dropout3(fc3_r)
+        return fc3_d
 
     def forward(self, image, im_info=None, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
         self._image_gt_summaries['image'] = image
@@ -648,19 +729,16 @@ class Network(nn.Module):
             if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
                 bbox_gaussian = torch.distributions.Normal(0,torch.sqrt(torch.exp(self._predictions['a_bbox_var'])))
                 bbox_samples = bbox_gaussian.sample((self._num_aleatoric_samples,)) + bbox_mean
+                mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,im_info[2])
                 #TODO: Maybe detach here?
                 roi_coords = self._predictions['rois'][:,1:].unsqueeze(0).repeat(self._num_aleatoric_samples,1,1)
                 roi_coords = roi_coords.view(-1,roi_coords.shape[2])
                 bbox_samples = bbox_samples.view(-1,bbox_samples.shape[2])
                 bbox_inv_samples = bbox_transform_inv(roi_coords,bbox_samples,im_info[2])
                 bbox_inv_samples = bbox_inv_samples.view(self._num_aleatoric_samples,-1,bbox_inv_samples.shape[1])
-                #torch.set_printoptions(profile="full")
-                #print(bbox_inv_samples)
-                #torch.set_printoptions(profile="default")
-                #bbox_var = torch.var(bbox_inv_samples,dim=0)
-                bbox_var_2 = self._compute_bbox_var(bbox_inv_samples)
-                self._predictions['bbox_inv_pred'] = torch.mean(bbox_inv_samples,dim=0)
-                self._predictions['a_bbox_inv_var'] = bbox_var_2
+                bbox_inv_var = self._compute_bbox_var(bbox_inv_samples)
+                self._predictions['bbox_inv_pred']  = mean_bbox_inv
+                self._predictions['a_bbox_inv_var'] = bbox_inv_var
             else:
                 bbox_inv_samples = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,im_info[2])
                 self._predictions['bbox_inv_pred'] = bbox_inv_samples
@@ -682,14 +760,23 @@ class Network(nn.Module):
             m.bias.data.zero_()
         
         normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
+        if(cfg.ENABLE_CUSTOM_TAIL):
+            normal_init(self.t_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.t_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.t_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
+
         normal_init(self.rpn_cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
         if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
-            normal_init(self.bbox_post_dropout_fc, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.bbox_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.bbox_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.bbox_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
         if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
-            normal_init(self.cls_post_dropout_fc, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.cls_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.cls_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.cls_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
         if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
             normal_init(self.bbox_al_var_net, 0, 0.001, True)
         #if(cfg.ENABLE_ALEATORIC_CLS_VAR):
