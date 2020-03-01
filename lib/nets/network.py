@@ -502,7 +502,7 @@ class Network(nn.Module):
         #TODO: Make domain shift here
         self._predictions['bbox_pred'] = torch.mean(bbox_pred,dim=0)
         if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            bbox_var  = self.bbox_al_var_net(bbox_pred_in)
+            bbox_var  = self.bbox_al_var_net(fc7)
             self._predictions['a_bbox_var']  = torch.mean(bbox_var,dim=0)
         if(cfg.ENABLE_ALEATORIC_CLS_VAR):
             a_cls_var   = self.cls_al_var_net(cls_score_in)
@@ -551,7 +551,7 @@ class Network(nn.Module):
             self.t_fc2           = nn.Linear(self._fc7_channels*8,self._fc7_channels*4)
             self.t_fc3           = nn.Linear(self._fc7_channels*4,self._fc7_channels*2)
         self.cls_score_net       = nn.Linear(int(self._fc7_channels/4), self._num_classes)
-        self.bbox_pred_net       = nn.Linear(int(self._fc7_channels/4), self._num_classes * 4)
+        self.bbox_pred_net       = nn.Linear(int(self._fc7_channels/2), self._num_classes * 4)
         if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
             self.bbox_fc1        = nn.Linear(self._fc7_channels, self._fc7_channels)
             self.bbox_fc2        = nn.Linear(self._fc7_channels, int(self._fc7_channels/2))
@@ -559,7 +559,7 @@ class Network(nn.Module):
             #self.bbox_dropout         = nn.Dropout(0.4)
             #self.bbox_post_dropout_fc = nn.Linear(self._fc7_channels*2, self._fc7_channels)
         if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            self.bbox_al_var_net  = nn.Linear(int(self._fc7_channels/4), self._num_classes * 4)
+            self.bbox_al_var_net  = nn.Linear(int(self._fc7_channels), self._num_classes * 4)
         if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
             self.cls_fc1        = nn.Linear(self._fc7_channels, self._fc7_channels)
             self.cls_fc2        = nn.Linear(self._fc7_channels, int(self._fc7_channels/2))
@@ -683,7 +683,7 @@ class Network(nn.Module):
 
     def _bbox_tail(self,fc7,dropout_en):
         if(dropout_en):
-            fc_dropout_rate   = 0.5
+            fc_dropout_rate   = 0.4
         else:
             fc_dropout_rate   = 0.0
         fc_dropout1   = nn.Dropout(fc_dropout_rate)
@@ -699,7 +699,7 @@ class Network(nn.Module):
         fc3     = self.bbox_fc3(fc2_d)
         fc3_r   = fc_relu(fc3)
         fc3_d   = fc_dropout2(fc3_r)
-        return fc3_d
+        return fc2_d
 
     def _custom_tail(self,pool5,dropout_en):
         pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._num_mc_run,1,1)
@@ -818,9 +818,9 @@ class Network(nn.Module):
         if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
             normal_init(self.cls_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
             normal_init(self.cls_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            normal_init(self.cls_fc3, 0, 0.01, True)
+            normal_init(self.cls_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
         if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            normal_init(self.bbox_al_var_net, 0, 0.002, True)
+            normal_init(self.bbox_al_var_net, 0, 0.05, cfg.TRAIN.TRUNCATED)
         if(cfg.ENABLE_ALEATORIC_CLS_VAR):
             normal_init(self.cls_al_var_net, 0, 0.04,cfg.TRAIN.TRUNCATED)
     # Extract the head feature maps, for example for vgg16 it is conv5_3
