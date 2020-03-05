@@ -37,7 +37,6 @@ import tensorboardX as tb
 
 from scipy.misc import imresize
 
-
 class Network(nn.Module):
     def __init__(self):
         nn.Module.__init__(self)
@@ -58,14 +57,7 @@ class Network(nn.Module):
         self._cnt = 0
         self._variables_to_fix = {}
         self._device = 'cuda'
-        self._cum_losses['total_loss']        = 0
-        self._cum_losses['rpn_cross_entropy'] = 0
-        self._cum_losses['rpn_loss_box']      = 0
-        self._cum_losses['cross_entropy']     = 0
-        self._cum_losses['loss_box']          = 0
-        self._cum_losses['a_bbox_var']        = 0
-        self._cum_losses['a_cls_entropy']     = 0
-        self._cum_losses['a_cls_var']         = 0
+        self._cum_loss_keys = ['total_loss','rpn_cross_entropy','rpn_loss_box','cross_entropy','loss_box','a_bbox_var','a_cls_entropy','a_cls_var']
         self._cum_gt_entries                  = 0
         self._batch_gt_entries                = 0
         self._cum_im_entries                  = 0
@@ -509,7 +501,7 @@ class Network(nn.Module):
             a_cls_var = torch.exp(torch.mean(a_cls_var,dim=0))
             self._predictions['a_cls_var']   = a_cls_var
 
-    def _image_to_head(self):
+    def _input_to_head(self):
         raise NotImplementedError
 
     def _head_to_tail(self, pool5):
@@ -624,7 +616,7 @@ class Network(nn.Module):
     def _predict(self):
         # This is just _build_network in tf-faster-rcnn
         torch.backends.cudnn.benchmark = False
-        net_conv = self._image_to_head()
+        net_conv = self._input_to_head()
         #print(net_conv)
         # build the anchors for the image
         self._anchor_component(net_conv.size(2), net_conv.size(3))
@@ -941,25 +933,16 @@ class Network(nn.Module):
         #Computes losses for single image
         self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
         #.item() converts single element of type pytorch.tensor to a primitive float/int
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, a_bbox_var, a_cls_entropy, a_cls_var = self._losses["rpn_cross_entropy"].item(), \
-                                                                                                          self._losses['rpn_loss_box'].item(), \
-                                                                                                          self._losses['cross_entropy'].item(), \
-                                                                                                          self._losses['loss_box'].item(), \
-                                                                                                          self._losses['total_loss'].item(), \
-                                                                                                          self._losses['a_bbox_var'].item(), \
-                                                                                                          self._losses['a_cls_entropy'].item(), \
-                                                                                                          self._losses['a_cls_var'].item()
+        loss = self._losses['total_loss'].item()
         #utils.timer.timer.tic('backward')
         self._losses['total_loss'].backward()
         #utils.timer.timer.toc('backward')
-        self._cum_losses['total_loss']        += loss
-        self._cum_losses['rpn_cross_entropy'] += rpn_loss_cls
-        self._cum_losses['rpn_loss_box']      += rpn_loss_box
-        self._cum_losses['cross_entropy']     += loss_cls
-        self._cum_losses['loss_box']          += loss_box
-        self._cum_losses['a_bbox_var']        += a_bbox_var
-        self._cum_losses['a_cls_var']         += a_cls_var
-        self._cum_losses['a_cls_entropy']     += a_cls_entropy
+        for key in self._cum_loss_keys:
+            if(key in self._cum_losses):
+                self._cum_losses[key] += self._losses[key].item()
+            else:
+                self._cum_losses[key] = self._losses[key].item().copy()
+
         self._batch_gt_entries                += len(blobs['gt_boxes'])
         if(update_weights):
             #Clip gradients
@@ -971,18 +954,11 @@ class Network(nn.Module):
                     self._event_summaries[k] += self._cum_losses[k]
                 else:
                     self._event_summaries[k] = self._cum_losses[k]
-            self._cum_losses['total_loss']        = 0
-            self._cum_losses['rpn_cross_entropy'] = 0
-            self._cum_losses['rpn_loss_box']      = 0
-            self._cum_losses['cross_entropy']     = 0
-            self._cum_losses['loss_box']          = 0
-            self._cum_losses['a_bbox_var']        = 0
-            self._cum_losses['a_cls_var']         = 0
-            self._cum_losses['a_cls_entropy']     = 0
-            self._batch_gt_entries                = 0
-            self._cum_gt_entries                  += self._batch_gt_entries
+            self._cum_losses        = {}
+            self._batch_gt_entries  = 0
+            self._cum_gt_entries   += self._batch_gt_entries
         #Should actually be divided by batch size, but whatever
-        self._cum_im_entries                     += 1
+        self._cum_im_entries       += 1
         self.delete_intermediate_states()
 
         return loss
