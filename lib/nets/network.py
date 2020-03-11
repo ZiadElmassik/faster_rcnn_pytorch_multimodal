@@ -22,6 +22,7 @@ import os
 import utils.timer
 
 from layer_utils.snippets import generate_anchors_pre
+from layer_utils.generate_3d_anchors import tile_anchors_3d
 from layer_utils.proposal_layer import proposal_layer
 from layer_utils.proposal_top_layer import proposal_top_layer
 from layer_utils.anchor_target_layer import anchor_target_layer
@@ -32,7 +33,7 @@ from model.bbox_transform import bbox_transform_inv, clip_boxes
 from torchvision.ops import RoIAlign, RoIPool
 from torchvision import transforms
 from model.config import cfg
-
+import utils.bbox as bbox_utils
 import tensorboardX as tb
 
 from scipy.misc import imresize
@@ -53,7 +54,7 @@ class Network(nn.Module):
         self._score_summaries = {}
         self._val_event_summaries = {}
         self._event_summaries = {}
-        self._image_gt_summaries = {}
+        self._gt_summaries = {}
         self._cnt = 0
         self._variables_to_fix = {}
         self._device = 'cuda'
@@ -64,13 +65,15 @@ class Network(nn.Module):
         self._num_mc_run                      = 1
         self._num_aleatoric_samples           = cfg.NUM_ALEATORIC_SAMPLE
         #Set on every forward pass for use with proposal target layer
-        self._gt_boxes = None
-        self._gt_boxes_dc = None
+        self._gt_boxes      = None
+        self._true_gt_boxes = None
+        self._gt_boxes_dc   = None
 
     def _add_gt_image(self):
         # add back mean
-        image = ((self._image_gt_summaries['image']))*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
-        image = imresize(image[0], self._im_info[:2] / self._im_info[2])
+        image = ((self._gt_summaries['frame']))*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
+        frame_range = [self._info[1] - self._info[0], self._info[3] - self._info[2]]
+        image = imresize(image[0], frame_range / self._info[4])
         # BGR to RGB (opencv uses BGR)
         #print(image)
         #image = image[:,:,:,cfg.PIXEL_ARRANGE]
@@ -82,7 +85,7 @@ class Network(nn.Module):
         # use a customized visualization function to visualize the boxes
         self._add_gt_image()
         image = draw_bounding_boxes(\
-                          self._gt_image, self._image_gt_summaries['gt_boxes'], self._image_gt_summaries['im_info'])
+                          self._gt_image, self._gt_summaries['gt_boxes'], self._gt_summaries['info'][4])
 
         return tb.summary.image('GROUND_TRUTH',
                                 image[0].astype('float32') / 255.0, dataformats='HWC')
@@ -105,13 +108,13 @@ class Network(nn.Module):
 
     def _proposal_top_layer(self, rpn_cls_prob, rpn_bbox_pred):
         rois, rpn_scores = proposal_top_layer(\
-                                        rpn_cls_prob, rpn_bbox_pred, self._im_info,
+                                        rpn_cls_prob, rpn_bbox_pred, self._info,
                                          self._feat_stride, self._anchors, self._num_anchors)
         return rois, rpn_scores
 
     def _proposal_layer(self, rpn_cls_prob, rpn_bbox_pred):
         rois, rpn_scores = proposal_layer(\
-                                        rpn_cls_prob, rpn_bbox_pred, self._im_info, self._mode,
+                                        rpn_cls_prob, rpn_bbox_pred, self._info, self._mode,
                                          self._feat_stride, self._anchors, self._num_anchors)
         return rois, rpn_scores
 
@@ -126,9 +129,17 @@ class Network(nn.Module):
                         0)(bottom, rois)
 
     def _anchor_target_layer(self, rpn_cls_score):
+        #Remove rotation element if LiDAR
+        # map of shape (..., H, W)
+        height, width = rpn_cls_score.data.shape[1:3]
+
+        gt_boxes = self._gt_boxes.data.cpu().numpy()
+        gt_boxes_dc = self._gt_boxes_dc.data.cpu().numpy()
+
         #.data is used to pull a tensor from a pytorch variable. Deprecated, but it grabs a copy of the data that will not be tracked by gradients
         rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = \
-            anchor_target_layer(rpn_cls_score.data, self._gt_boxes.data.cpu().numpy(), self._gt_boxes_dc.data.cpu().numpy(), self._im_info, self._feat_stride, self._anchors.data.cpu().numpy(), self._num_anchors)
+            anchor_target_layer(gt_boxes, gt_boxes_dc, self._info, self._feat_stride, self._anchors.data.cpu().numpy(), self._num_anchors, height, width)
+            # bbox_outside_weights
 
         rpn_labels = torch.from_numpy(rpn_labels).float().to(
             self._device)  #.set_shape([1, 1, None, None])
@@ -156,7 +167,7 @@ class Network(nn.Module):
 
     def _proposal_target_layer(self, rois, roi_scores):
         labels, rois, roi_scores, bbox_targets, bbox_inside_weights, bbox_outside_weights = \
-            proposal_target_layer(rois, roi_scores, self._gt_boxes, self._gt_boxes_dc, self._num_classes)
+            proposal_target_layer(rois, roi_scores, self._gt_boxes, self._true_gt_boxes, self._gt_boxes_dc, self._num_classes)
 
         self._proposal_targets['rois'] = rois
         self._proposal_targets['labels'] = labels.long()
@@ -171,13 +182,63 @@ class Network(nn.Module):
 
     def _anchor_component(self, height, width):
         # just to get the shape right
-        #height = int(math.ceil(self._im_info.data[0, 0] / self._feat_stride[0]))
-        #width = int(math.ceil(self._im_info.data[0, 1] / self._feat_stride[0]))
-        anchors, anchor_length = generate_anchors_pre(\
-                                              height, width,
-                                               self._feat_stride, self._anchor_scales, self._anchor_ratios)
+        #height = int(math.ceil(self._info.data[0, 0] / self._feat_stride[0]))
+        #width = int(math.ceil(self._info.data[0, 1] / self._feat_stride[0]))
+        if(cfg.NET_TYPE == 'image'):
+            anchors, anchor_length = generate_anchors_pre(\
+                                                height, width,
+                                                self._feat_stride, self._anchor_scales, self._anchor_ratios)
+        elif(cfg.NET_TYPE == 'lidar'):
+            #TODO: How should these fields be populated?        
+            area_3d = [cfg.LIDAR.X_RANGE,cfg.LIDAR.Y_RANGE,cfg.LIDAR.Z_RANGE]
+            anchor_3d_sizes = cfg.LIDAR.ANCHOR_SIZES
+            anchor_stride = cfg.LIDAR.ANCHOR_STRIDE
+            anchors, anchor_length = tile_anchors_3d(area_3d, anchor_3d_sizes, anchor_stride)
+            anchors = bbox_utils.bbox_3d_to_bev_axis_aligned(anchors)
         self._anchors = torch.from_numpy(anchors).to(self._device)
         self._anchor_length = anchor_length
+
+    def _3d_smooth_l1_loss(self,
+                           stage,
+                           bbox_pred,
+                           bbox_targets,
+                           bbox_var,
+                           bbox_inside_weights,
+                           bbox_outside_weights,
+                           sigma=1.0,
+                           dim=[1]):
+        sigma_2 = sigma**2
+        if((stage == 'RPN' and cfg.ENABLE_RPN_BBOX_VAR) or (stage == 'DET' and cfg.ENABLE_ALEATORIC_BBOX_VAR)):
+            bbox_var_en = True
+        else:
+            bbox_var_en = False
+        box_diff = bbox_pred - bbox_targets
+        #print(bbox_targets.size())
+        #print(bbox_pred.size())
+        #Ignore diff when target is not a foreground target
+        # a mask array for the foreground anchors (called “bbox_inside_weights”) is used to calculate the loss as a vector operation and avoid for-if loops.
+        in_box_diff = bbox_inside_weights * box_diff
+        abs_in_box_diff = torch.abs(in_box_diff)
+        smoothL1_sign = (abs_in_box_diff < 1. / sigma_2).detach().float()
+        in_loss_box = torch.pow(in_box_diff, 2) * (sigma_2 / 2.) * smoothL1_sign + (abs_in_box_diff - (0.5 / sigma_2)) * (1. - smoothL1_sign)
+        #Used to normalize the predictions, this is only used in the RPN
+        #By default negative(background) and positive(foreground) samples have equal weighting
+        if(bbox_var_en):
+            #Don't need covariance matrix as it collapses itself in the end anyway
+            #eye = torch.eye().repeat(in_var.shape[0])
+            #torch.set_printoptions(profile="full")
+            #torch.set_printoptions(profile="default")
+            in_loss_box = 0.5*in_loss_box*torch.exp(-bbox_var) + 0.5*torch.exp(bbox_var)
+            in_loss_box = in_loss_box*bbox_inside_weights
+        out_loss_box = bbox_outside_weights * in_loss_box
+        loss_box = out_loss_box
+        #Condense down to 1D array, each entry is the box_loss for an individual box, array is batch size of all predicted boxes
+        #[loss,y,x,num_anchor]
+        for i in sorted(dim, reverse=True):
+            loss_box = loss_box.sum(i)
+        #print(loss_box.size())
+        loss_box = loss_box.mean()
+        return loss_box
 
     def _smooth_l1_loss(self,
                         stage,
@@ -220,6 +281,7 @@ class Network(nn.Module):
         #print(loss_box.size())
         loss_box = loss_box.mean()
         return loss_box
+
     #Determine losses for single batch image
     def _add_losses(self, sigma_rpn=3.0):
         # RPN, class loss
@@ -250,6 +312,7 @@ class Network(nn.Module):
             'rpn_bbox_inside_weights']
         rpn_bbox_outside_weights = self._anchor_targets[
             'rpn_bbox_outside_weights']
+        if(cfg.NET_TYPE == 'image'):
         rpn_loss_box = self._smooth_l1_loss(
             'RPN',
             rpn_bbox_pred,
@@ -259,6 +322,16 @@ class Network(nn.Module):
             rpn_bbox_outside_weights,
             sigma=sigma_rpn,
             dim=[1, 2, 3])
+        elif(cfg.NET_TYPE == 'lidar'):
+            rpn_loss_box = self._3d_smooth_l1_loss(
+                'RPN',
+                rpn_bbox_pred,
+                rpn_bbox_targets,
+                [],
+                rpn_bbox_inside_weights,
+                rpn_bbox_outside_weights,
+                sigma=sigma_rpn,
+                dim=[1, 2, 3])
         # RCNN, class loss, performed on class score logits
         cls_score = self._predictions['cls_score']
         cls_prob  = self._predictions['cls_prob']
@@ -292,7 +365,10 @@ class Network(nn.Module):
             a_bbox_var = None
             self._losses['a_bbox_var'] = torch.tensor(0)
         #Compute loss box
-        loss_box = self._smooth_l1_loss('DET', bbox_pred, bbox_targets, a_bbox_var, bbox_inside_weights, bbox_outside_weights)
+        if(cfg.NET_TYPE == 'image'):
+            loss_box = self._smooth_l1_loss('DET', bbox_pred, bbox_targets, a_bbox_var, bbox_inside_weights, bbox_outside_weights)
+        elif(cfg.NET_TYPE == 'lidar'):
+            loss_box = self._3d_smooth_l1_loss('DET', bbox_pred, bbox_targets, a_bbox_var, bbox_inside_weights, bbox_outside_weights)
         #Assign computed losses to be tracked in tensorboard
         self._losses['cross_entropy'] = cross_entropy
         self._losses['loss_box'] = loss_box
@@ -444,9 +520,10 @@ class Network(nn.Module):
             #At this point, rpn_bbox_pred is a normalized delta
             rois, roi_scores = self._proposal_layer(
                 rpn_cls_prob, rpn_bbox_pred)  # rois, roi_scores are varible
-            #target labels and roi's to supply later half of network with golden results
+            #targets for first stage loss computation (against the RPN predictions)
             rpn_labels = self._anchor_target_layer(rpn_cls_score)
-            #ROI's passed into proposal_target_layer have been pre-transformed and are true bounding boxes
+            #N.B. - ROI's passed into proposal_target_layer have been pre-transformed and are true bounding boxes
+            #Generate final detection targets from ROI's generated from the RPN
             rois, _ = self._proposal_target_layer(rois, roi_scores)
             self._predictions['rpn_labels'] = rpn_labels
         else:
@@ -589,7 +666,7 @@ class Network(nn.Module):
                 if var.requires_grad:
                     summaries.append(self._add_train_summary(k, var))
 
-            self._image_gt_summaries = {}
+            self._gt_summaries = {}
         else:
             for key, var in self._val_event_summaries.items():
                 #print("adding validation summary for key {:s} with value {:f} and summary size divisor {:d}".format(key,var,summary_size))
@@ -719,14 +796,31 @@ class Network(nn.Module):
         fc3_d   = fc_dropout3(fc3_r)
         return fc3_d
 
-    def forward(self, image, im_info=None, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
-        self._image_gt_summaries['image'] = image
-        self._image_gt_summaries['gt_boxes'] = gt_boxes
-        self._image_gt_summaries['gt_boxes_dc'] = gt_boxes_dc
-        self._image_gt_summaries['im_info'] = im_info
-        self._image = torch.from_numpy(image.transpose([0, 3, 1,
-                                                        2])).to(self._device)
-        self._im_info = im_info  # No need to change; actually it can be an list
+    def forward(self, frame, info=None, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
+        self._gt_summaries['frame'] = frame
+        self._gt_summaries['gt_boxes'] = gt_boxes
+        self._gt_summaries['gt_boxes_dc'] = gt_boxes_dc
+        self._gt_summaries['info'] = info
+        self._info = info  # No need to change; actually it can be an list
+        scale = info[4]
+        if(cfg.NET_TYPE == 'image'):
+            self._image = torch.from_numpy(frame.transpose([0, 3, 1,
+                                                            2])).to(self._device)
+            true_gt_boxes = gt_boxes
+
+        elif(cfg.NET_TYPE == 'lidar'):
+            self._bev_map = torch.from_numpy(frame).to(self._device)
+            #TODO: Should info contain bev extants? Seems like the cleanest way
+            gt_box_labels = gt_boxes[:,-1]
+            gt_bboxes     = gt_boxes[:,:-1]
+            true_gt_boxes = bbox_utils.bbox_3d_to_bev(gt_bboxes, info)
+            gt_boxes      = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_bboxes, info)
+            gt_boxes_dc   = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_boxes_dc, info)
+            true_gt_boxes = np.hstack(true_gt_boxes, gt_box_labels)
+            gt_boxes      = np.hstack(gt_boxes, gt_box_labels)
+
+        self._true_gt_boxes = torch.from_numpy(true_gt_boxes).to(
+            self._device) if true_gt_boxes is not None else None
         self._gt_boxes = torch.from_numpy(gt_boxes).to(
             self._device) if gt_boxes is not None else None
         self._gt_boxes_dc = torch.from_numpy(gt_boxes_dc).to(
@@ -754,18 +848,18 @@ class Network(nn.Module):
             if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
                 bbox_gaussian = torch.distributions.Normal(0,torch.sqrt(torch.exp(self._predictions['a_bbox_var'])))
                 bbox_samples = bbox_gaussian.sample((self._num_aleatoric_samples,)) + bbox_mean
-                mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,im_info[2])
+                mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,scale)
                 #TODO: Maybe detach here?
                 roi_coords = self._predictions['rois'][:,1:].unsqueeze(0).repeat(self._num_aleatoric_samples,1,1)
                 roi_coords = roi_coords.view(-1,roi_coords.shape[2])
                 bbox_samples = bbox_samples.view(-1,bbox_samples.shape[2])
-                bbox_inv_samples = bbox_transform_inv(roi_coords,bbox_samples,im_info[2])
+                bbox_inv_samples = bbox_transform_inv(roi_coords,bbox_samples,scale)
                 bbox_inv_samples = bbox_inv_samples.view(self._num_aleatoric_samples,-1,bbox_inv_samples.shape[1])
                 bbox_inv_var = self._compute_bbox_var(bbox_inv_samples)
                 self._predictions['bbox_inv_pred']  = mean_bbox_inv
                 self._predictions['a_bbox_inv_var'] = bbox_inv_var
             else:
-                mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,im_info[2])
+                mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,scale)
                 self._predictions['bbox_inv_pred'] = mean_bbox_inv
         #Reset to mode == VAL
         self._mode = mode
@@ -823,16 +917,17 @@ class Network(nn.Module):
         return feat
 
     # only useful during testing mode
-    def test_image(self, image, im_info):
+    def test_frame(self, frame, info):
         self.eval()
+        scale = info[4]
         with torch.no_grad():
-            self.forward(image, im_info, None, None, mode='TEST')
+            self.forward(frame, info, None, None, mode='TEST')
         cls_score, cls_prob, bbox_pred, rois = self._predictions["cls_score"].data.cpu().detach(), \
                                                          self._predictions['cls_prob'].data.detach(), \
                                                          self._predictions['bbox_inv_pred'].data.detach(), \
                                                          self._predictions['rois'].data.detach()
 
-        a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,im_info[2])
+        a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,scale)
 
         return cls_score, cls_prob, a_cls_entropy, a_cls_var, e_cls_mutual_info, bbox_pred, a_bbox_var, e_bbox_var, rois
 
@@ -850,7 +945,7 @@ class Network(nn.Module):
         #Flip between eval and train mode -> gradient doesnt accumulate?
         self.eval() # model.eval() will notify all your layers that you are in eval mode, that way, batchnorm or dropout layers will work in eval mode instead of training mode.
         with torch.no_grad():
-            self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
+            self.forward(blobs['data'], blobs['info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
         self.train()
         summary           = None
         bbox_pred         = self._predictions['bbox_inv_pred'].data.detach() #(self._fc7_channels, self._num_classes * 4)
@@ -858,7 +953,7 @@ class Network(nn.Module):
         rois             = self._predictions['rois'].data.detach()
         roi_labels       = self._proposal_targets['labels'].data.detach()
 
-        a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,blobs['im_info'][2])
+        a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,blobs['info'][4])
         for k in self._losses.keys():
             if(k in self._val_event_summaries):
                 self._val_event_summaries[k] += self._losses[k].item()
@@ -931,7 +1026,7 @@ class Network(nn.Module):
 
     def train_step(self, blobs, train_op, update_weights=False):
         #Computes losses for single image
-        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
+        self.forward(blobs['data'], blobs['info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
         #.item() converts single element of type pytorch.tensor to a primitive float/int
         loss = self._losses['total_loss'].item()
         #utils.timer.timer.tic('backward')
@@ -971,7 +1066,7 @@ class Network(nn.Module):
         return loss, summary
 
     def train_step_no_return(self, blobs, train_op):
-        self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
+        self.forward(blobs['data'], blobs['info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
         train_op.zero_grad()
         self._losses['total_loss'].backward()
         train_op.step()
