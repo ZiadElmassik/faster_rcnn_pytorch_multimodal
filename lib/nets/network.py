@@ -22,7 +22,7 @@ import os
 import utils.timer
 
 from layer_utils.snippets import generate_anchors_pre
-from layer_utils.generate_3d_anchors import tile_anchors_3d
+from layer_utils.generate_3d_anchors import GridAnchor3dGenerator
 from layer_utils.proposal_layer import proposal_layer
 from layer_utils.proposal_top_layer import proposal_top_layer
 from layer_utils.anchor_target_layer import anchor_target_layer
@@ -64,6 +64,7 @@ class Network(nn.Module):
         self._cum_im_entries                  = 0
         self._num_mc_run                      = 1
         self._num_aleatoric_samples           = cfg.NUM_ALEATORIC_SAMPLE
+        self._bev_extants                     = [cfg.LIDAR.X_RANGE,cfg.LIDAR.Y_RANGE,cfg.LIDAR.Z_RANGE]
         #Set on every forward pass for use with proposal target layer
         self._gt_boxes      = None
         self._true_gt_boxes = None
@@ -117,16 +118,6 @@ class Network(nn.Module):
                                         rpn_cls_prob, rpn_bbox_pred, self._info, self._mode,
                                          self._feat_stride, self._anchors, self._num_anchors)
         return rois, rpn_scores
-
-    #FYI this is a fancy way of instantiating a class and calling its main function
-    def _roi_pool_layer(self, bottom, rois):
-        #Has restriction on batch, only one dim allowed
-        return RoIPool((cfg.POOLING_SIZE, cfg.POOLING_SIZE),
-                       1.0 / 16.0)(bottom, rois)
-
-    def _roi_align_layer(self, bottom, rois):
-        return RoIAlign((cfg.POOLING_SIZE, cfg.POOLING_SIZE), 1.0 / 16.0,
-                        0)(bottom, rois)
 
     def _anchor_target_layer(self, rpn_cls_score):
         #Remove rotation element if LiDAR
@@ -189,56 +180,20 @@ class Network(nn.Module):
                                                 height, width,
                                                 self._feat_stride, self._anchor_scales, self._anchor_ratios)
         elif(cfg.NET_TYPE == 'lidar'):
-            #TODO: How should these fields be populated?        
-            area_3d = [cfg.LIDAR.X_RANGE,cfg.LIDAR.Y_RANGE,cfg.LIDAR.Z_RANGE]
-            anchor_3d_sizes = cfg.LIDAR.ANCHOR_SIZES
-            anchor_stride = cfg.LIDAR.ANCHOR_STRIDE
-            anchors, anchor_length = tile_anchors_3d(area_3d, anchor_3d_sizes, anchor_stride)
+            anchor_generator = GridAnchor3dGenerator()
+            anchors, anchor_length = anchor_generator._generate()
             anchors = bbox_utils.bbox_3d_to_bev_axis_aligned(anchors)
         self._anchors = torch.from_numpy(anchors).to(self._device)
         self._anchor_length = anchor_length
 
-    def _3d_smooth_l1_loss(self,
-                           stage,
-                           bbox_pred,
-                           bbox_targets,
-                           bbox_var,
-                           bbox_inside_weights,
-                           bbox_outside_weights,
-                           sigma=1.0,
-                           dim=[1]):
-        sigma_2 = sigma**2
-        if((stage == 'RPN' and cfg.ENABLE_RPN_BBOX_VAR) or (stage == 'DET' and cfg.ENABLE_ALEATORIC_BBOX_VAR)):
-            bbox_var_en = True
-        else:
-            bbox_var_en = False
-        box_diff = bbox_pred - bbox_targets
-        #print(bbox_targets.size())
-        #print(bbox_pred.size())
-        #Ignore diff when target is not a foreground target
-        # a mask array for the foreground anchors (called “bbox_inside_weights”) is used to calculate the loss as a vector operation and avoid for-if loops.
-        in_box_diff = bbox_inside_weights * box_diff
+    def _huber_loss(self,labels, targets, huber_delta):
+        box_diff = labels - targets
         abs_in_box_diff = torch.abs(in_box_diff)
-        smoothL1_sign = (abs_in_box_diff < 1. / sigma_2).detach().float()
-        in_loss_box = torch.pow(in_box_diff, 2) * (sigma_2 / 2.) * smoothL1_sign + (abs_in_box_diff - (0.5 / sigma_2)) * (1. - smoothL1_sign)
-        #Used to normalize the predictions, this is only used in the RPN
-        #By default negative(background) and positive(foreground) samples have equal weighting
-        if(bbox_var_en):
-            #Don't need covariance matrix as it collapses itself in the end anyway
-            #eye = torch.eye().repeat(in_var.shape[0])
-            #torch.set_printoptions(profile="full")
-            #torch.set_printoptions(profile="default")
-            in_loss_box = 0.5*in_loss_box*torch.exp(-bbox_var) + 0.5*torch.exp(bbox_var)
-            in_loss_box = in_loss_box*bbox_inside_weights
-        out_loss_box = bbox_outside_weights * in_loss_box
-        loss_box = out_loss_box
-        #Condense down to 1D array, each entry is the box_loss for an individual box, array is batch size of all predicted boxes
-        #[loss,y,x,num_anchor]
-        for i in sorted(dim, reverse=True):
-            loss_box = loss_box.sum(i)
-        #print(loss_box.size())
-        loss_box = loss_box.mean()
-        return loss_box
+        smoothL1_sign = (abs_in_box_diff < huber_delta / sigma_2).detach().float()
+        above_one = smoothL1_sign + (abs_in_box_diff - (0.5 * huber_delta / sigma_2)) * (1. - smoothL1_sign)
+        below_one = torch.pow(in_box_diff, 2) * (sigma_2 / 2.) * smoothL1_sign
+        in_loss_box = below_one + above_one
+        return in_loss_box
 
     def _smooth_l1_loss(self,
                         stage,
@@ -254,24 +209,24 @@ class Network(nn.Module):
             bbox_var_en = True
         else:
             bbox_var_en = False
-        box_diff = bbox_pred - bbox_targets
-        #print(bbox_targets.size())
-        #print(bbox_pred.size())
         #Ignore diff when target is not a foreground target
         # a mask array for the foreground anchors (called “bbox_inside_weights”) is used to calculate the loss as a vector operation and avoid for-if loops.
-        in_box_diff = bbox_inside_weights * box_diff
-        abs_in_box_diff = torch.abs(in_box_diff)
-        smoothL1_sign = (abs_in_box_diff < 1. / sigma_2).detach().float()
-        in_loss_box = torch.pow(in_box_diff, 2) * (sigma_2 / 2.) * smoothL1_sign + (abs_in_box_diff - (0.5 / sigma_2)) * (1. - smoothL1_sign)
-        #Used to normalize the predictions, this is only used in the RPN
-        #By default negative(background) and positive(foreground) samples have equal weighting
+        bbox_pred = bbox_pred*bbox_inside_weights
+        bbox_targets = bbox_targets*bbox_inside_weights
+        if(cfg.NET_TYPE == 'lidar'):
+            #TODO: Sum across elements
+            loss_box = F.smooth_l1_loss(bbox_pred[:,:-1],bbox_targets[:,:-1],reduction='none')
+            ry_loss = self._huber_loss(bbox_pred[:,-1],bbox_targets[:,-1],1.0/9.0)
+            in_loss_box = loss_box + ry_loss
+        else:
+            in_loss_box = F.smooth_l1_loss(bbox_pred,bbox_targets,reduction='none')
+
         if(bbox_var_en):
             #Don't need covariance matrix as it collapses itself in the end anyway
-            #eye = torch.eye().repeat(in_var.shape[0])
-            #torch.set_printoptions(profile="full")
-            #torch.set_printoptions(profile="default")
             in_loss_box = 0.5*in_loss_box*torch.exp(-bbox_var) + 0.5*torch.exp(bbox_var)
             in_loss_box = in_loss_box*bbox_inside_weights
+        #Used to normalize the predictions, this is only used in the RPN
+        #By default negative(background) and positive(foreground) samples have equal weighting
         out_loss_box = bbox_outside_weights * in_loss_box
         loss_box = out_loss_box
         #Condense down to 1D array, each entry is the box_loss for an individual box, array is batch size of all predicted boxes
@@ -312,7 +267,6 @@ class Network(nn.Module):
             'rpn_bbox_inside_weights']
         rpn_bbox_outside_weights = self._anchor_targets[
             'rpn_bbox_outside_weights']
-        if(cfg.NET_TYPE == 'image'):
         rpn_loss_box = self._smooth_l1_loss(
             'RPN',
             rpn_bbox_pred,
@@ -322,16 +276,6 @@ class Network(nn.Module):
             rpn_bbox_outside_weights,
             sigma=sigma_rpn,
             dim=[1, 2, 3])
-        elif(cfg.NET_TYPE == 'lidar'):
-            rpn_loss_box = self._3d_smooth_l1_loss(
-                'RPN',
-                rpn_bbox_pred,
-                rpn_bbox_targets,
-                [],
-                rpn_bbox_inside_weights,
-                rpn_bbox_outside_weights,
-                sigma=sigma_rpn,
-                dim=[1, 2, 3])
         # RCNN, class loss, performed on class score logits
         cls_score = self._predictions['cls_score']
         cls_prob  = self._predictions['cls_prob']
@@ -365,10 +309,7 @@ class Network(nn.Module):
             a_bbox_var = None
             self._losses['a_bbox_var'] = torch.tensor(0)
         #Compute loss box
-        if(cfg.NET_TYPE == 'image'):
-            loss_box = self._smooth_l1_loss('DET', bbox_pred, bbox_targets, a_bbox_var, bbox_inside_weights, bbox_outside_weights)
-        elif(cfg.NET_TYPE == 'lidar'):
-            loss_box = self._3d_smooth_l1_loss('DET', bbox_pred, bbox_targets, a_bbox_var, bbox_inside_weights, bbox_outside_weights)
+        loss_box = self._smooth_l1_loss('DET', bbox_pred, bbox_targets, a_bbox_var, bbox_inside_weights, bbox_outside_weights)
         #Assign computed losses to be tracked in tensorboard
         self._losses['cross_entropy'] = cross_entropy
         self._losses['loss_box'] = loss_box
@@ -548,35 +489,7 @@ class Network(nn.Module):
         self._num_mc_run = num_mc_run
 
     def _region_classification(self, fc7):
-        #fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
-        if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
-            cls_score_in = self._cls_tail(fc7,True)
-        else:
-            cls_score_in = fc7
-        cls_score = self.cls_score_net(cls_score_in)
-        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
-            bbox_pred_in = self._bbox_tail(fc7,True)
-        else:
-            bbox_pred_in = fc7
-        bbox_pred = self.bbox_pred_net(bbox_pred_in)
-
-        cls_score_mean = torch.mean(cls_score,dim=0)
-        cls_pred = torch.max(cls_score_mean, 1)[1]
-        cls_prob = torch.mean(F.softmax(cls_score, dim=2),dim=0)
-        self._mc_run_output['bbox_pred'] = bbox_pred
-        self._mc_run_output['cls_score'] = cls_score
-        self._predictions['cls_score'] = cls_score_mean
-        self._predictions['cls_pred'] = cls_pred
-        self._predictions['cls_prob'] = cls_prob
-        #TODO: Make domain shift here
-        self._predictions['bbox_pred'] = torch.mean(bbox_pred,dim=0)
-        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            bbox_var  = self.bbox_al_var_net(fc7)
-            self._predictions['a_bbox_var']  = torch.mean(bbox_var,dim=0)
-        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
-            a_cls_var   = self.cls_al_var_net(cls_score_in)
-            a_cls_var = torch.exp(torch.mean(a_cls_var,dim=0))
-            self._predictions['a_cls_var']   = a_cls_var
+        raise NotImplementedError
 
     def _input_to_head(self):
         raise NotImplementedError
@@ -604,40 +517,6 @@ class Network(nn.Module):
 
         # Initialize layers
         self._init_modules()
-
-    def _init_modules(self):
-        self._init_head_tail()
-
-        # rpn
-        self.rpn_net = nn.Conv2d(
-            self._net_conv_channels, cfg.RPN_CHANNELS, [3, 3], padding=1)
-        self.rpn_cls_score_net = nn.Conv2d(cfg.RPN_CHANNELS, self._num_anchors * 2, [1, 1])
-
-        self.rpn_bbox_pred_net = nn.Conv2d(cfg.RPN_CHANNELS,
-                                           self._num_anchors * 4, [1, 1])
-        if(cfg.ENABLE_CUSTOM_TAIL):
-            self.t_fc1           = nn.Linear(self._roi_pooling_channels,self._fc7_channels*8)
-            self.t_fc2           = nn.Linear(self._fc7_channels*8,self._fc7_channels*4)
-            self.t_fc3           = nn.Linear(self._fc7_channels*4,self._fc7_channels*2)
-        self.cls_score_net       = nn.Linear(int(self._fc7_channels/4), self._num_classes)
-        self.bbox_pred_net       = nn.Linear(int(self._fc7_channels/2), self._num_classes * 4)
-        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
-            self.bbox_fc1        = nn.Linear(self._fc7_channels, self._fc7_channels)
-            self.bbox_fc2        = nn.Linear(self._fc7_channels, int(self._fc7_channels/2))
-            self.bbox_fc3        = nn.Linear(int(self._fc7_channels/2), int(self._fc7_channels/4))
-            #self.bbox_dropout         = nn.Dropout(0.4)
-            #self.bbox_post_dropout_fc = nn.Linear(self._fc7_channels*2, self._fc7_channels)
-        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            self.bbox_al_var_net  = nn.Linear(int(self._fc7_channels), self._num_classes * 4)
-        if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
-            self.cls_fc1        = nn.Linear(self._fc7_channels, self._fc7_channels)
-            self.cls_fc2        = nn.Linear(self._fc7_channels, int(self._fc7_channels/2))
-            self.cls_fc3        = nn.Linear(int(self._fc7_channels/2), int(self._fc7_channels/4))
-            #self.cls_dropout         = nn.Dropout(0.4)
-            #self.cls_post_dropout_fc = nn.Linear(self._fc7_channels*2, self._fc7_channels)
-        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
-            self.cls_al_var_net   = nn.Linear(int(self._fc7_channels/4),self._num_classes)
-        self.init_weights()
 
     def _run_summary_op(self, val=False, summary_size=1):
         """
@@ -693,7 +572,7 @@ class Network(nn.Module):
     def _predict(self):
         # This is just _build_network in tf-faster-rcnn
         torch.backends.cudnn.benchmark = False
-        net_conv = self._input_to_head()
+        net_conv = self._input_to_head(self._frame)
         #print(net_conv)
         # build the anchors for the image
         self._anchor_component(net_conv.size(2), net_conv.size(3))
@@ -730,72 +609,6 @@ class Network(nn.Module):
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
 
-    def _cls_tail(self,fc7,dropout_en):
-        if(dropout_en):
-            fc_dropout_rate   = 0.5
-        else:
-            fc_dropout_rate   = 0.0
-        fc_dropout1   = nn.Dropout(fc_dropout_rate)
-        fc_dropout2   = nn.Dropout(fc_dropout_rate)
-        fc_dropout3   = nn.Dropout(fc_dropout_rate)
-        fc_relu      = nn.ReLU(inplace=True)
-        fc1     = self.cls_fc1(fc7)
-        fc1_r   = fc_relu(fc1)
-        fc1_d   = fc_dropout1(fc1_r)
-        fc2     = self.cls_fc2(fc1_d)
-        fc2_r   = fc_relu(fc2)
-        fc2_d   = fc_dropout2(fc2_r)
-        fc3     = self.cls_fc3(fc2_d)
-        fc3_r   = fc_relu(fc3)
-        fc3_d   = fc_dropout2(fc3_r)
-        return fc3_d
-
-    def _bbox_tail(self,fc7,dropout_en):
-        if(dropout_en):
-            fc_dropout_rate   = 0.4
-        else:
-            fc_dropout_rate   = 0.0
-        fc_dropout1   = nn.Dropout(fc_dropout_rate)
-        fc_dropout2   = nn.Dropout(fc_dropout_rate)
-        fc_dropout3   = nn.Dropout(fc_dropout_rate)
-        fc_relu      = nn.ReLU(inplace=True)
-        fc1     = self.bbox_fc1(fc7)
-        fc1_r   = fc_relu(fc1)
-        fc1_d   = fc_dropout1(fc1_r)
-        fc2     = self.bbox_fc2(fc1_d)
-        fc2_r   = fc_relu(fc2)
-        fc2_d   = fc_dropout2(fc2_r)
-        fc3     = self.bbox_fc3(fc2_d)
-        fc3_r   = fc_relu(fc3)
-        fc3_d   = fc_dropout2(fc3_r)
-        return fc2_d
-
-    def _custom_tail(self,pool5,dropout_en):
-        pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._num_mc_run,1,1)
-        if(dropout_en):
-            conv_dropout_rate = 0.2
-            fc_dropout_rate   = 0.5
-        else:
-            conv_dropout_rate = 0.0
-            fc_dropout_rate   = 0.0
-        pool_dropout = nn.Dropout(conv_dropout_rate)
-        fc_dropout1   = nn.Dropout(fc_dropout_rate)
-        fc_dropout2   = nn.Dropout(fc_dropout_rate)
-        fc_dropout3   = nn.Dropout(fc_dropout_rate)
-        fc_dropout4   = nn.Dropout(fc_dropout_rate)
-        fc_relu      = nn.ReLU(inplace=True)
-        pool5_d = pool_dropout(pool5)
-        fc1     = self.t_fc1(pool5_d)
-        fc1_r   = fc_relu(fc1)
-        fc1_d   = fc_dropout1(fc1_r)
-        fc2     = self.t_fc2(fc1_d)
-        fc2_r   = fc_relu(fc2)
-        fc2_d   = fc_dropout2(fc2_r)
-        fc3     = self.t_fc3(fc2_d)
-        fc3_r   = fc_relu(fc3)
-        fc3_d   = fc_dropout3(fc3_r)
-        return fc3_d
-
     def forward(self, frame, info=None, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
         self._gt_summaries['frame'] = frame
         self._gt_summaries['gt_boxes'] = gt_boxes
@@ -804,20 +617,23 @@ class Network(nn.Module):
         self._info = info  # No need to change; actually it can be an list
         scale = info[4]
         if(cfg.NET_TYPE == 'image'):
-            self._image = torch.from_numpy(frame.transpose([0, 3, 1,
+            self._frame = torch.from_numpy(frame.transpose([0, 3, 1,
                                                             2])).to(self._device)
             true_gt_boxes = gt_boxes
 
         elif(cfg.NET_TYPE == 'lidar'):
-            self._bev_map = torch.from_numpy(frame).to(self._device)
+            self._frame = torch.from_numpy(frame).to(self._device)
             #TODO: Should info contain bev extants? Seems like the cleanest way
-            gt_box_labels = gt_boxes[:,-1]
-            gt_bboxes     = gt_boxes[:,:-1]
-            true_gt_boxes = bbox_utils.bbox_3d_to_bev(gt_bboxes, info)
-            gt_boxes      = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_bboxes, info)
-            gt_boxes_dc   = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_boxes_dc, info)
-            true_gt_boxes = np.hstack(true_gt_boxes, gt_box_labels)
-            gt_boxes      = np.hstack(gt_boxes, gt_box_labels)
+            gt_box_labels = gt_boxes[:, -1, np.newaxis]
+            gt_bboxes     = gt_boxes[:, :-1]
+            gt_boxes      = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_bboxes)
+            #gt_boxes      = bbox_utils.bbox_bev_to_voxel_grid(gt_boxes,self._bev_extants,info)
+            gt_boxes      = np.hstack((gt_boxes, gt_box_labels))
+            #Still in 3D format
+            true_gt_boxes = np.hstack((gt_bboxes, gt_box_labels))
+            #Dont care areas
+            gt_boxes_dc   = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_boxes_dc)
+            #gt_boxes_dc   = bbox_utils.bbox_bev_to_voxel_grid(gt_boxes,self._bev_extants,info)
 
         self._true_gt_boxes = torch.from_numpy(true_gt_boxes).to(
             self._device) if true_gt_boxes is not None else None
@@ -864,51 +680,6 @@ class Network(nn.Module):
         #Reset to mode == VAL
         self._mode = mode
 
-    def init_weights(self):
-        def uniform_init(m, min_v, max_v,bias=0.0):
-            """
-      weight initalizer: truncated normal and random normal.
-      """
-            m.weight.data.uniform_(min_v, max_v)
-            #m.bias.data.zero_()
-            m.bias.data.fill_(bias)
-
-        def normal_init(m, mean, stddev, truncated=False,bias=0.0):
-            """
-      weight initalizer: truncated normal and random normal.
-      """
-            # x is a parameter
-            if truncated:
-                #In-place functions to save GPU mem
-                m.weight.data.normal_().fmod_(2).mul_(stddev).add_(
-                    mean)  # not a perfect approximation
-            else:
-                m.weight.data.normal_(mean, stddev)
-            #m.bias.data.zero_()
-            m.bias.data.fill_(bias)
-        
-        normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-        if(cfg.ENABLE_CUSTOM_TAIL):
-            normal_init(self.t_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            normal_init(self.t_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            normal_init(self.t_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
-
-        normal_init(self.rpn_cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-        normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-        normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-        normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
-        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
-            normal_init(self.bbox_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            normal_init(self.bbox_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            normal_init(self.bbox_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
-        if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
-            normal_init(self.cls_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            normal_init(self.cls_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            normal_init(self.cls_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
-        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            normal_init(self.bbox_al_var_net, 0, 0.05, cfg.TRAIN.TRUNCATED)
-        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
-            normal_init(self.cls_al_var_net, 0, 0.04,cfg.TRAIN.TRUNCATED)
     # Extract the head feature maps, for example for vgg16 it is conv5_3
     # only useful during testing mode
     def extract_head(self, image):
