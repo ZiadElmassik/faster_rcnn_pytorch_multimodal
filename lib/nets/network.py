@@ -64,7 +64,7 @@ class Network(nn.Module):
         self._cum_im_entries                  = 0
         self._num_mc_run                      = 1
         self._num_aleatoric_samples           = cfg.NUM_ALEATORIC_SAMPLE
-        self._bev_extants                     = [cfg.LIDAR.X_RANGE,cfg.LIDAR.Y_RANGE,cfg.LIDAR.Z_RANGE]
+        self._bev_extents                     = [cfg.LIDAR.X_RANGE,cfg.LIDAR.Y_RANGE,cfg.LIDAR.Z_RANGE]
         #Set on every forward pass for use with proposal target layer
         self._gt_boxes      = None
         self._true_gt_boxes = None
@@ -216,7 +216,8 @@ class Network(nn.Module):
         if(cfg.NET_TYPE == 'lidar'):
             #TODO: Sum across elements
             loss_box = F.smooth_l1_loss(bbox_pred[:,:-1],bbox_targets[:,:-1],reduction='none')
-            ry_loss = self._huber_loss(bbox_pred[:,-1],bbox_targets[:,-1],1.0/9.0)
+            sine_heading = torch.sin(bbox_pred[:,-1],bbox_targets[:,-1])
+            ry_loss = self._huber_loss(sine_heading,1.0/9.0)
             in_loss_box = loss_box + ry_loss
         else:
             in_loss_box = F.smooth_l1_loss(bbox_pred,bbox_targets,reduction='none')
@@ -622,7 +623,8 @@ class Network(nn.Module):
             true_gt_boxes = gt_boxes
 
         elif(cfg.NET_TYPE == 'lidar'):
-            self._frame = torch.from_numpy(frame).to(self._device)
+            self._frame = torch.from_numpy(frame.transpose([0, 3, 1,
+                                                            2])).to(self._device)
             #TODO: Should info contain bev extants? Seems like the cleanest way
             gt_box_labels = gt_boxes[:, -1, np.newaxis]
             gt_bboxes     = gt_boxes[:, :-1]
