@@ -28,7 +28,7 @@ from layer_utils.proposal_top_layer import proposal_top_layer
 from layer_utils.anchor_target_layer import anchor_target_layer
 from layer_utils.proposal_target_layer import proposal_target_layer
 from utils.visualization import draw_bounding_boxes
-from model.bbox_transform import bbox_transform_inv, clip_boxes
+from model.bbox_transform import bbox_transform_inv, lidar_bbox_transform_inv, clip_boxes
 
 from torchvision.ops import RoIAlign, RoIPool
 from torchvision import transforms
@@ -186,7 +186,7 @@ class Network(nn.Module):
         elif(self._net_type == 'lidar'):
             anchor_generator = GridAnchor3dGenerator()
             anchor_length, anchors = anchor_generator._generate(height, width, self._feat_stride, self._anchor_scales, self._anchor_ratios)
-            anchors = bbox_utils.bbox_3d_to_bev_axis_aligned(anchors)
+            anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*self._feat_stride-1, (height)*self._feat_stride-1)
             self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
         self._anchors = torch.from_numpy(anchors).to(self._device)
         self._anchor_length = anchor_length
@@ -223,7 +223,9 @@ class Network(nn.Module):
             #TODO: Sum across elements
             loss_box = F.smooth_l1_loss(bbox_pred[:,0:7:7],bbox_targets[:,0:7:7],reduction='none')
             #TODO: Do i need to compute the sin of the difference here?
-            ry_loss = self._huber_loss(bbox_pred[:,7::7],bbox_targets[:,7::7],1.0/9.0,sigma)
+            sin_pred = torch.sin(bbox_pred[:,7::7])
+            sin_targets = torch.sin(bbox_targets[:,7::7])
+            ry_loss = self._huber_loss(sin_pred,sin_targets,1.0/9.0,sigma)
             in_loss_box = torch.sum(loss_box,axis=1) + ry_loss
             bbox_outside_weights = torch.mean(bbox_outside_weights,axis=1)
         else:
@@ -531,7 +533,10 @@ class Network(nn.Module):
         """
         summaries = []
         # Add image gt
-        summaries.append(self._add_gt_image_summary())
+        if(self._net_type == 'image'):
+            summaries.append(self._add_gt_image_summary())
+        elif(self._net_type == 'lidar'):
+            print('vg summaries on tensorboard not supported yet.')
         # Add event_summaries
         if not val:
             for key, var in self._event_summaries.items():
@@ -623,7 +628,7 @@ class Network(nn.Module):
         self._gt_summaries['gt_boxes_dc'] = gt_boxes_dc
         self._gt_summaries['info'] = info
         self._info = info  # No need to change; actually it can be an list
-        scale = info[4]
+        scale = info[6]
         self._frame = torch.from_numpy(frame.transpose([0, 3, 1,
                                                         2])).to(self._device)
         if(self._net_type == 'image'):
@@ -633,11 +638,11 @@ class Network(nn.Module):
             #TODO: Should info contain bev extants? Seems like the cleanest way
             gt_box_labels = gt_boxes[:, -1, np.newaxis]
             gt_bboxes     = gt_boxes[:, :-1]
-            gt_boxes      = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_bboxes)
+            gt_boxes      = bbox_utils.bbaa_graphics_gems(gt_bboxes,info[1],info[3])
             #gt_boxes      = bbox_utils.bbox_bev_to_voxel_grid(gt_boxes,self._bev_extants,info)
-            gt_boxes      = np.hstack((gt_boxes, gt_box_labels))
+            gt_boxes      = np.concatenate((gt_boxes, gt_box_labels),axis=1)
             #Still in 3D format
-            true_gt_boxes = np.hstack((gt_bboxes, gt_box_labels))
+            true_gt_boxes = np.concatenate((gt_bboxes, gt_box_labels),axis=1)
             #Dont care areas
             #gt_boxes_dc   = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_boxes_dc)
             gt_boxes_dc = None
@@ -656,20 +661,39 @@ class Network(nn.Module):
             self._mode = 'TRAIN'
 
         self._predict()
-        #self._draw_and_save_lidar_anchors(frame,info,self._anchor_targets['anchors'])
-        self._draw_and_save_lidar_targets(frame,info,self._anchor_targets['rpn_bbox_targets'],self._anchor_targets['anchors'],self._anchor_targets['rpn_labels'],self._anchor_targets['rpn_bbox_inside_weights'],'anchor')
-        #self._draw_and_save_lidar_targets(frame,info,self._proposal_targets['bbox_targets'],self._proposal_targets['rois'],self._proposal_targets['labels'],self._proposal_targets['bbox_inside_weights'],'proposal')
+        #ENABLE to draw all anchors
+        #self._draw_and_save_lidar_anchors(frame,
+        #                                  info,
+        #                                  self._anchor_targets['anchors'])
+
+        #ENABLE to draw all anchor targets
+        #self._draw_and_save_lidar_targets(frame,
+        #                                  info,
+        #                                  self._anchor_targets['rpn_bbox_targets'],
+        #                                  self._anchor_targets['anchors'],
+        #                                  self._anchor_targets['rpn_labels'],
+        #                                  self._anchor_targets['rpn_bbox_inside_weights'],
+        #                                  'anchor')
+
+        #ENABLE to draw all proposal targets
+        #self._draw_and_save_lidar_targets(frame,
+        #                                  info,
+        #                                  self._proposal_targets['bbox_targets'],
+        #                                  self._proposal_targets['rois'],
+        #                                  self._proposal_targets['labels'],
+        #                                  self._proposal_targets['bbox_inside_weights'],
+        #                                  'proposal')
         if(mode == 'VAL' or mode == 'TRAIN'):
             self._add_losses()  # compute losses
         if(mode == 'VAL' or mode == 'TEST'):
             bbox_pred = self._predictions['bbox_pred']
             #bbox_targets are pre-normalized for loss, so modifying here.
             #Expand as -> broadcast 
-            stds = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(
+            stds = bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_STDS).repeat(
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
-            means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
+            means = bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).repeat(
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
-            #Batch Norm?
+            #Denormalize bbox target predictions
             bbox_mean = bbox_pred.mul(stds).add(means)
             #bbox_var = self._predictions['a_bbox_var']
             if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
@@ -686,97 +710,15 @@ class Network(nn.Module):
                 self._predictions['bbox_inv_pred']  = mean_bbox_inv
                 self._predictions['a_bbox_inv_var'] = bbox_inv_var
             else:
-                mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,scale)
+                if(self._net_type == 'image'):
+                    mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,scale)
+                elif(self._net_type == 'lidar'):
+                    roi_height = cfg.LIDAR.ANCHORS[0][2]
+                    roi_zc     = cfg.LIDAR.ANCHORS[0][2]/2
+                    mean_bbox_inv = lidar_bbox_transform_inv(self._predictions['rois'][:,1:],roi_height,roi_zc,bbox_mean,scale)
                 self._predictions['bbox_inv_pred'] = mean_bbox_inv
         #Reset to mode == VAL
         self._mode = mode
-
-
-    def _draw_and_save_lidar_targets(self,frame,info,targets,rois,labels,mask,target_type):
-        datapath = os.path.join(cfg.DATA_DIR, 'waymo','debug')
-        out_file = os.path.join(datapath,'{}_target_{}.png'.format(target_type,self._cnt))
-        #lidb = waymo_lidb()
-        #Extract voxel grid size
-        width   = int(info[1] - info[0] + 1)
-        #Y is along height axis in image domain
-        height  = int(info[3] - info[2] + 1)
-        #lidb._imheight = height
-        #lidb._imwidth  = width
-        voxel_grid = frame[0]
-        voxel_grid_rgb = np.zeros((voxel_grid.shape[0],voxel_grid.shape[1],3))
-        voxel_grid_rgb[:,:,0] = np.max(voxel_grid[:,:,0:cfg.LIDAR.NUM_SLICES],axis=2)
-        max_height = np.max(voxel_grid_rgb[:,:,0])
-        min_height = np.min(voxel_grid_rgb[:,:,0])
-        voxel_grid_rgb[:,:,0] = np.clip(voxel_grid_rgb[:,:,0]*(255/(max_height - min_height)),0,255)
-        voxel_grid_rgb[:,:,1] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES].max())
-        voxel_grid_rgb[:,:,2] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1].max())
-        voxel_grid_rgb        = voxel_grid_rgb.astype(dtype='uint8')
-        img = Image.fromarray(voxel_grid_rgb,'RGB')
-        draw = ImageDraw.Draw(img)
-        if(target_type == 'anchor'):
-            mask   = mask.view(-1,4)
-            labels = labels.permute(0,2,3,1).reshape(-1)
-        #if(target_type == 'anchor'):
-        if(target_type == 'proposal'):
-            sel_targets = torch.where(labels == 0, targets[:,0:7],targets[:,7:14])
-            mask = torch.where(labels == 0, mask[:,0:7], mask[:,7:14])
-            rois = rois[:,1:5]
-            targets = torch.cat((sel_targets[:,0:2],sel_targets[:,3:5]),dim=1)
-        rois = rois.view(-1,4)
-        targets = targets.view(-1,4)
-        anchors = bbox_transform_inv(rois,targets)
-        #else:
-        #    anchors = bbox_3d_transform_inv_all_boxes(anchors_3d,targets)
-            #anchors = 3d_to_bev(anchors)
-        for i, bbox in enumerate(anchors.view(-1,4)):
-            bbox_mask = mask[i]
-            bbox_label = int(labels[i])
-            roi        = rois[i]
-            np_bbox = None
-            #if(torch.mean(bbox_mask) > 0):
-            if(bbox_label == 1):
-                np_bbox = bbox.data.cpu().numpy()
-                draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
-                draw.rectangle(np_bbox,width=1,outline='green')
-            elif(bbox_label == 0):
-                np_bbox = roi.data.cpu().numpy()
-                draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
-                draw.rectangle(np_bbox,width=1,outline='red')
-        print('Saving BEV map file at location {}'.format(out_file))
-        img.save(out_file,'png')
-        self._cnt += 1
-
-    def _draw_and_save_lidar_anchors(self,frame,info,anchors):
-        datapath = os.path.join(cfg.DATA_DIR, 'waymo','debug')
-        out_file = os.path.join(datapath,'{}.png'.format(self._cnt))
-        #lidb = waymo_lidb()
-        #Extract voxel grid size
-        width   = int(info[1] - info[0] + 1)
-        #Y is along height axis in image domain
-        height  = int(info[3] - info[2] + 1)
-        #lidb._imheight = height
-        #lidb._imwidth  = width
-        voxel_grid = frame[0]
-        voxel_grid_rgb = np.zeros((voxel_grid.shape[0],voxel_grid.shape[1],3))
-        voxel_grid_rgb[:,:,0] = np.max(voxel_grid[:,:,0:cfg.LIDAR.NUM_SLICES],axis=2)
-        max_height = np.max(voxel_grid_rgb[:,:,0])
-        min_height = np.min(voxel_grid_rgb[:,:,0])
-        voxel_grid_rgb[:,:,0] = np.clip(voxel_grid_rgb[:,:,0]*(255/(max_height - min_height)),0,255)
-        voxel_grid_rgb[:,:,1] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES].max())
-        voxel_grid_rgb[:,:,2] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1].max())
-        voxel_grid_rgb        = voxel_grid_rgb.astype(dtype='uint8')
-        img = Image.fromarray(voxel_grid_rgb,'RGB')
-        draw = ImageDraw.Draw(img)
-        for i, bbox in enumerate(anchors):
-            if(i%90 == 0):
-                draw.rectangle(bbox,width=1,outline='green')
-            if(i%900 == 1):
-                draw.rectangle(bbox,width=1,outline='yellow')
-            if(i%90 == 2):
-                draw.rectangle(bbox,width=1,outline='blue')
-        print('Saving BEV map file at location {}'.format(out_file))
-        img.save(out_file,'png')
-        self._cnt += 1
 
     # Extract the head feature maps, for example for vgg16 it is conv5_3
     # only useful during testing mode
@@ -822,7 +764,7 @@ class Network(nn.Module):
         rois             = self._predictions['rois'].data.detach()
         roi_labels       = self._proposal_targets['labels'].data.detach()
 
-        a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,blobs['info'][4])
+        uncertainties = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,blobs['info'][4])
         for k in self._losses.keys():
             if(k in self._val_event_summaries):
                 self._val_event_summaries[k] += self._losses[k].item()
@@ -831,24 +773,25 @@ class Network(nn.Module):
         if(update_summaries is True):
             summary = self._run_summary_op(True,sum_size)
         self.delete_intermediate_states()
-        return summary, rois, roi_labels, bbox_pred, a_bbox_var, e_bbox_var, cls_prob, a_cls_entropy, a_cls_var, e_cls_mutual_info
+        return summary, rois, roi_labels, cls_prob, bbox_pred, uncertainties
 
     def _uncertainty_postprocess(self,bbox_pred,cls_prob,rois,im_scale):
+        uncertainties = {}
         if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            a_bbox_var = self._predictions['a_bbox_inv_var'].data.detach() #(self._fc7_channels, self._num_classes * 4)
+            uncertainties['a_bbox_var'] = self._predictions['a_bbox_inv_var'].data.detach() #(self._fc7_channels, self._num_classes * 4)
         else:
-            a_bbox_var = None
+            uncertainties['a_bbox_var'] = None
         if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
             cls_prob = self._predictions['cls_prob'] #(self._fc7_channels, self._num_classes * 4)
             #TODO: This should not be taking the mean yet, we need to filter by top indices
             #a_cls_entropy = -torch.mean(a_cls_entropy)*torch.log(torch.mean(a_cls_entropy)) - (1-torch.mean(a_cls_entropy))*torch.log(1-torch.mean(a_cls_entropy))
-            a_cls_entropy = self._categorical_entropy(cls_prob)
-            a_cls_entropy = a_cls_entropy.data.detach()
-            a_cls_var = self._predictions['a_cls_var']
+            a_cls_entropy                   = self._categorical_entropy(cls_prob)
+            uncertainties['a_cls_entropy']  = a_cls_entropy.data.detach()
+            uncertainties['a_cls_var']      = self._predictions['a_cls_var']
             #Compute class entropy
         else:
-            a_cls_entropy = None
-            a_cls_var     = None
+            uncertainties['a_cls_entropy'] = None
+            uncertainties['a_cls_var']     = None
         #if(cfg.ENABLE_ALEATORIC_CLS_VAR):
         #    cls_var = self._predictions['cls_var'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
         #else:
@@ -858,10 +801,11 @@ class Network(nn.Module):
             e_cls_score = self._mc_run_output['cls_score'].detach()
             #Compute average entropy via mutual information
             e_cls_mutual_info = self._categorical_mutual_information(e_cls_score)
+            uncertainties['e_cls_mutual_info'] = e_cls_mutual_info
             self._mc_run_results['e_cls_mutual_info'] = torch.mean(e_cls_mutual_info)
             self._mc_run_output['e_cls_mutual_info'] = e_cls_mutual_info
         else:
-            e_cls_mutual_info = torch.tensor([0])
+            uncertainties['e_cls_mutual_info'] = torch.tensor([0])
 
         if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
             #All of this to simply get the predictions from [M,N,C] to [M*N,C] interleaved.
@@ -880,18 +824,19 @@ class Network(nn.Module):
             #Way #3 to compute bbox var
             #Doesnt work??
             #e_bbox_var = torch.var(mc_bbox_pred,dim=0)
+            uncertainties['e_bbox_var'] = e_bbox_var
             self._mc_run_output['e_bbox_var'] = e_bbox_var
             self._mc_run_results['e_bbox_var'] = torch.mean(e_bbox_var)
             #Compute average variance
         else:
-            e_bbox_var = torch.tensor([0])
+            uncertainties['e_bbox_var'] = torch.tensor([0])
         if(cfg.ENABLE_EPISTEMIC_BBOX_VAR or cfg.ENABLE_EPISTEMIC_CLS_VAR):
             for k in self._mc_run_results.keys():
                 if(k in self._val_event_summaries):
                     self._val_event_summaries[k] += self._mc_run_results[k].item()
                 else:
                     self._val_event_summaries[k] = self._mc_run_results[k].item()
-        return a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info
+        return uncertainties
 
     def train_step(self, blobs, train_op, update_weights=False):
         #Computes losses for single image
@@ -908,9 +853,11 @@ class Network(nn.Module):
                 self._cum_losses[key] = self._losses[key].item()
 
         self._batch_gt_entries                += len(blobs['gt_boxes'])
+        #Pseudo batching, only one image on the GPU at a time, but weights are updated at intervals
+
         if(update_weights):
             #Clip gradients
-            torch.nn.utils.clip_grad_norm_([x[1] for x in self.named_parameters()],20)
+            torch.nn.utils.clip_grad_norm_([x[1] for x in self.named_parameters()],cfg.GRAD_MAX_CLIP)
             train_op.step()
             train_op.zero_grad()
             for k in self._cum_losses.keys():
@@ -960,3 +907,119 @@ class Network(nn.Module):
             self, {k: v
                    for k, v in state_dict.items() if k in self.state_dict()}
             )
+
+    def _draw_and_save_lidar_targets(self,frame,info,targets,rois,labels,mask,target_type):
+        datapath = os.path.join(cfg.DATA_DIR, 'waymo','debug')
+        out_file = os.path.join(datapath,'{}_target_{}.png'.format(target_type,self._cnt))
+        #lidb = waymo_lidb()
+        #Extract voxel grid size
+        width   = int(info[1] - info[0] + 1)
+        #Y is along height axis in image domain
+        height  = int(info[3] - info[2] + 1)
+        #lidb._imheight = height
+        #lidb._imwidth  = width
+        voxel_grid = frame[0]
+        voxel_grid_rgb = np.zeros((voxel_grid.shape[0],voxel_grid.shape[1],3))
+        voxel_grid_rgb[:,:,0] = np.max(voxel_grid[:,:,0:cfg.LIDAR.NUM_SLICES],axis=2)
+        max_height = np.max(voxel_grid_rgb[:,:,0])
+        min_height = np.min(voxel_grid_rgb[:,:,0])
+        voxel_grid_rgb[:,:,0] = np.clip(voxel_grid_rgb[:,:,0]*(255/(max_height - min_height)),0,255)
+        voxel_grid_rgb[:,:,1] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES].max())
+        voxel_grid_rgb[:,:,2] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1].max())
+        voxel_grid_rgb        = voxel_grid_rgb.astype(dtype='uint8')
+        img = Image.fromarray(voxel_grid_rgb,'RGB')
+        draw = ImageDraw.Draw(img)
+        if(target_type == 'anchor'):
+            mask   = mask.view(-1,4)
+            labels = labels.permute(0,2,3,1).reshape(-1)
+        #if(target_type == 'anchor'):
+        if(target_type == 'proposal'):
+            #Target is in a (N,K*7) format, transform to (N,7) where corresponding label dictates what class bbox belongs to 
+            sel_targets = torch.where(labels == 0, targets[:,0:7],targets[:,7:14])
+            #Get subset of mask for specific class selected
+            mask = torch.where(labels == 0, mask[:,0:7], mask[:,7:14])
+            sel_targets = sel_targets*mask
+            rois = rois[:,1:5]
+            #Extract XC,YC and L,W
+            targets = torch.cat((sel_targets[:,0:2],sel_targets[:,3:5]),dim=1)
+            stds = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_STDS[0:4]).unsqueeze(0).expand_as(targets)
+            means = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_MEANS[0:4]).unsqueeze(0).expand_as(targets)
+            targets = targets.mul(stds).add(means)
+        rois = rois.view(-1,4)
+        targets = targets.view(-1,4)
+        anchors = bbox_transform_inv(rois,targets)
+        label_mask = labels + 1
+        label_idx  = label_mask.nonzero().squeeze(1)
+        anchors_filtered = anchors[label_idx,:]
+        #else:
+        #    anchors = bbox_3d_transform_inv_all_boxes(anchors_3d,targets)
+            #anchors = 3d_to_bev(anchors)
+        for i, bbox in enumerate(anchors.view(-1,4)):
+            bbox_mask = mask[i]
+            bbox_label = int(labels[i])
+            roi        = rois[i]
+            np_bbox = None
+            #if(torch.mean(bbox_mask) > 0):
+            if(bbox_label == 1):
+                np_bbox = bbox.data.cpu().numpy()
+                draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
+                draw.rectangle(np_bbox,width=1,outline='green')
+                if(np_bbox[0] >= np_bbox[2]):
+                    print('x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
+                if(np_bbox[1] >= np_bbox[3]):
+                    print('y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
+            elif(bbox_label == 0):
+                np_bbox = roi.data.cpu().numpy()
+                draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
+                draw.rectangle(np_bbox,width=1,outline='red')
+                if(np_bbox[0] >= np_bbox[2]):
+                    print('x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
+                if(np_bbox[1] >= np_bbox[3]):
+                    print('y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
+        print('Saving BEV map file at location {}'.format(out_file))
+        img.save(out_file,'png')
+        self._cnt += 1
+
+    """
+    Function: _draw_and_save_lidar_anchors
+    Useful for debug, place within forward() loop. Allows visualization of a subset of anchors over the voxelgrid array
+    Arguments:
+    ----------
+    frame   -> the voxel grid frame
+    info    -> size of the voxel grid frame (x_min,x_max,y_min,y_max,z_min,z_max)
+    anchors -> (Nx4) BEV axis aligned anchors
+    output:
+    -------
+    draws png files to a specific subfolder, dictated by cfg.DATA_DIR
+    """
+    def _draw_and_save_lidar_anchors(self,frame,info,anchors):
+        datapath = os.path.join(cfg.DATA_DIR, 'waymo','debug')
+        out_file = os.path.join(datapath,'{}.png'.format(self._cnt))
+        #lidb = waymo_lidb()
+        #Extract voxel grid size
+        width   = int(info[1] - info[0] + 1)
+        #Y is along height axis in image domain
+        height  = int(info[3] - info[2] + 1)
+        #lidb._imheight = height
+        #lidb._imwidth  = width
+        voxel_grid = frame[0]
+        voxel_grid_rgb = np.zeros((voxel_grid.shape[0],voxel_grid.shape[1],3))
+        voxel_grid_rgb[:,:,0] = np.max(voxel_grid[:,:,0:cfg.LIDAR.NUM_SLICES],axis=2)
+        max_height = np.max(voxel_grid_rgb[:,:,0])
+        min_height = np.min(voxel_grid_rgb[:,:,0])
+        voxel_grid_rgb[:,:,0] = np.clip(voxel_grid_rgb[:,:,0]*(255/(max_height - min_height)),0,255)
+        voxel_grid_rgb[:,:,1] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES].max())
+        voxel_grid_rgb[:,:,2] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1].max())
+        voxel_grid_rgb        = voxel_grid_rgb.astype(dtype='uint8')
+        img = Image.fromarray(voxel_grid_rgb,'RGB')
+        draw = ImageDraw.Draw(img)
+        for i, bbox in enumerate(anchors.data.cpu().numpy()):
+            if(i%90 == 0):
+                draw.rectangle(bbox,width=1,outline=(255,0,0))
+            if(i%900 == 1):
+                draw.rectangle(bbox,width=1,outline=(0,255,0))
+            if(i%90 == 2):
+                draw.rectangle(bbox,width=1,outline=(0,0,255))
+        print('Saving BEV map file at location {}'.format(out_file))
+        img.save(out_file,'png')
+        self._cnt += 1
