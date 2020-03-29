@@ -233,10 +233,11 @@ class Network(nn.Module):
             #TODO: Sum across elements
             loss_box = self._huber_loss(bbox_pred_aa,targets_aa,1.0,sigma)
             #TODO: Do i need to compute the sin of the difference here?
-            sin_pred = torch.sin(bbox_pred[:,7::7])
-            sin_targets = torch.sin(bbox_targets[:,7::7])
+            sin_pred = torch.sin(bbox_pred.reshape(-1,7)[:,6:7].reshape(-1,elem_rm))
+            sin_targets = torch.sin(bbox_targets.reshape(-1,7)[:,6:7].reshape(-1,elem_rm))
             ry_loss = self._huber_loss(sin_pred,sin_targets,1.0/9.0,sigma)
-            in_loss_box = torch.cat((loss_box,ry_loss),dim=2)
+
+            in_loss_box = torch.cat((loss_box.reshape(-1,6),ry_loss.reshape(-1,1)),dim=1).reshape(-1,bbox_shape[1])
             #bbox_outside_weights = torch.mean(bbox_outside_weights,axis=1)
         else:
             in_loss_box = self._huber_loss(bbox_pred,bbox_targets,1.0,sigma)
