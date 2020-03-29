@@ -49,6 +49,7 @@ class Network(nn.Module):
         self._anchor_targets = {}
         self._proposal_targets = {}
         self._layers = {}
+        self.timers = {}
         self._gt_image = None
         self._act_summaries = {}
         self._score_summaries = {}
@@ -79,8 +80,9 @@ class Network(nn.Module):
     def _add_gt_image(self):
         # add back mean
         image = ((self._gt_summaries['frame']))*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
-        frame_range = [self._info[1] - self._info[0], self._info[3] - self._info[2]]
-        image = imresize(image[0], frame_range / self._info[4])
+        #Flip info from (xmin,xmax,ymin,ymax) to (ymin,ymax,xmin,xmax) due to frame being rotated
+        frame_range = [self._info[3] - self._info[2] + 1, self._info[1] - self._info[0] + 1]
+        image = imresize(image[0], frame_range / self._info[6])
         # BGR to RGB (opencv uses BGR)
         #print(image)
         #image = image[:,:,:,cfg.PIXEL_ARRANGE]
@@ -92,7 +94,7 @@ class Network(nn.Module):
         # use a customized visualization function to visualize the boxes
         self._add_gt_image()
         image = draw_bounding_boxes(\
-                          self._gt_image, self._gt_summaries['gt_boxes'], self._gt_summaries['info'][4])
+                          self._gt_image, self._gt_summaries['gt_boxes'], self._gt_summaries['info'][6])
 
         return tb.summary.image('GROUND_TRUTH',
                                 image[0].astype('float32') / 255.0, dataformats='HWC')
@@ -187,16 +189,16 @@ class Network(nn.Module):
             anchor_generator = GridAnchor3dGenerator()
             anchor_length, anchors = anchor_generator._generate(height, width, self._feat_stride, self._anchor_scales, self._anchor_ratios)
             anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*self._feat_stride-1, (height)*self._feat_stride-1)
-            self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
+        self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
         self._anchors = torch.from_numpy(anchors).to(self._device)
         self._anchor_length = anchor_length
 
-    def _huber_loss(self,labels, targets, huber_delta, sigma):
+    def _huber_loss(self,pred, targets, huber_delta, sigma):
         sigma_2 = sigma**2
-        box_diff = labels - targets
+        box_diff = pred - targets
         abs_in_box_diff = torch.abs(box_diff)
         smoothL1_sign = (abs_in_box_diff < huber_delta / sigma_2).detach().float()
-        above_one = smoothL1_sign + (abs_in_box_diff - (0.5 * huber_delta / sigma_2)) * (1. - smoothL1_sign)
+        above_one = (abs_in_box_diff - (0.5 * huber_delta / sigma_2)) * (1. - smoothL1_sign)
         below_one = torch.pow(box_diff, 2) * (sigma_2 / 2.) * smoothL1_sign
         in_loss_box = below_one + above_one
         return in_loss_box
@@ -209,8 +211,7 @@ class Network(nn.Module):
                         bbox_inside_weights,
                         bbox_outside_weights,
                         sigma=1.0,
-                        dim=[]):
-        sigma_2 = sigma**2
+                        dim=[1]):
         if((stage == 'RPN' and cfg.ENABLE_RPN_BBOX_VAR) or (stage == 'DET' and cfg.ENABLE_ALEATORIC_BBOX_VAR)):
             bbox_var_en = True
         else:
@@ -219,17 +220,26 @@ class Network(nn.Module):
         # a mask array for the foreground anchors (called “bbox_inside_weights”) is used to calculate the loss as a vector operation and avoid for-if loops.
         bbox_pred = bbox_pred*bbox_inside_weights
         bbox_targets = bbox_targets*bbox_inside_weights
+        torch.set_printoptions(profile="full")
+        #print('from _smooth_l1_loss')
+        #print(bbox_targets)
+        #print(bbox_inside_weights)
+        torch.set_printoptions(profile="default")
         if(self._net_type == 'lidar' and stage == 'DET'):
+            bbox_shape = [bbox_pred.shape[0],bbox_pred.shape[1]]
+            elem_rm = int(bbox_shape[1]/7)
+            bbox_pred_aa = bbox_pred.reshape(-1,7)[:,0:6].reshape(-1,bbox_shape[1]-elem_rm)
+            targets_aa   = bbox_targets.reshape(-1,7)[:,0:6].reshape(-1,bbox_shape[1]-elem_rm)
             #TODO: Sum across elements
-            loss_box = F.smooth_l1_loss(bbox_pred[:,0:7:7],bbox_targets[:,0:7:7],reduction='none')
+            loss_box = self._huber_loss(bbox_pred_aa,targets_aa,1.0,sigma)
             #TODO: Do i need to compute the sin of the difference here?
             sin_pred = torch.sin(bbox_pred[:,7::7])
             sin_targets = torch.sin(bbox_targets[:,7::7])
             ry_loss = self._huber_loss(sin_pred,sin_targets,1.0/9.0,sigma)
-            in_loss_box = torch.sum(loss_box,axis=1) + ry_loss
-            bbox_outside_weights = torch.mean(bbox_outside_weights,axis=1)
+            in_loss_box = torch.cat((loss_box,ry_loss),dim=2)
+            #bbox_outside_weights = torch.mean(bbox_outside_weights,axis=1)
         else:
-            in_loss_box = F.smooth_l1_loss(bbox_pred,bbox_targets,reduction='none')
+            in_loss_box = self._huber_loss(bbox_pred,bbox_targets,1.0,sigma)
 
         if(bbox_var_en):
             #Don't need covariance matrix as it collapses itself in the end anyway
@@ -244,6 +254,7 @@ class Network(nn.Module):
         for i in sorted(dim, reverse=True):
             loss_box = loss_box.sum(i)
         #print(loss_box.size())
+        #TODO: Could it be mean is taken at a different level between rpn and 2nd stage??
         loss_box = loss_box.mean()
         return loss_box
 
@@ -469,13 +480,19 @@ class Network(nn.Module):
 
         if self._mode == 'TRAIN':
             #At this point, rpn_bbox_pred is a normalized delta
+            #self.timers['proposal'].tic()
             rois, roi_scores = self._proposal_layer(
                 rpn_cls_prob, rpn_bbox_pred)  # rois, roi_scores are varible
+            #self.timers['proposal'].toc()
             #targets for first stage loss computation (against the RPN predictions)
+            self.timers['anchor_t'].tic()
             self._anchor_target_layer(rpn_cls_score)
+            self.timers['anchor_t'].toc()
             #N.B. - ROI's passed into proposal_target_layer have been pre-transformed and are true bounding boxes
             #Generate final detection targets from ROI's generated from the RPN
+            #self.timers['proposal_t'].tic()
             rois, _ = self._proposal_target_layer(rois, roi_scores)
+            #self.timers['proposal_t'].toc()
         else:
             if cfg.TEST.MODE == 'nms':
                 rois, _ = self._proposal_layer(rpn_cls_prob, rpn_bbox_pred)
@@ -583,12 +600,14 @@ class Network(nn.Module):
 
     def _predict(self):
         # This is just _build_network in tf-faster-rcnn
+        self.timers['net'].tic()
         torch.backends.cudnn.benchmark = False
         net_conv = self._input_to_head(self._frame)
         #print(net_conv)
         # build the anchors for the image
+        #self.timers['anchor_gen'].tic()
         self._anchor_component(net_conv.size(2), net_conv.size(3))
-        
+        #self.timers['anchor_gen'].toc()
         #print('run region proposal network')
         #numpy_out = net_conv.cpu().detach().numpy()[0, :, :, :]
         #print(numpy_out.shape)
@@ -619,6 +638,7 @@ class Network(nn.Module):
             fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
 
         self._region_classification(fc7)
+        self.timers['net'].toc()
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
 
@@ -662,27 +682,30 @@ class Network(nn.Module):
 
         self._predict()
         #ENABLE to draw all anchors
-        #self._draw_and_save_lidar_anchors(frame,
-        #                                  info,
-        #                                  self._anchor_targets['anchors'])
+        if(cfg.DEBUG.DRAW_ANCHORS):
+            self._draw_and_save_anchors(frame,
+                                        self._anchor_targets['anchors'],
+                                        self._net_type)
 
         #ENABLE to draw all anchor targets
-        #self._draw_and_save_lidar_targets(frame,
-        #                                  info,
-        #                                  self._anchor_targets['rpn_bbox_targets'],
-        #                                  self._anchor_targets['anchors'],
-        #                                  self._anchor_targets['rpn_labels'],
-        #                                  self._anchor_targets['rpn_bbox_inside_weights'],
-        #                                  'anchor')
+        if(cfg.DEBUG.DRAW_ANCHOR_T):
+            self._draw_and_save_targets(frame,
+                                        self._anchor_targets['rpn_bbox_targets'],
+                                        self._anchor_targets['anchors'],
+                                        self._anchor_targets['rpn_labels'],
+                                        self._anchor_targets['rpn_bbox_inside_weights'],
+                                        'anchor',
+                                        self._net_type)
 
         #ENABLE to draw all proposal targets
-        #self._draw_and_save_lidar_targets(frame,
-        #                                  info,
-        #                                  self._proposal_targets['bbox_targets'],
-        #                                  self._proposal_targets['rois'],
-        #                                  self._proposal_targets['labels'],
-        #                                  self._proposal_targets['bbox_inside_weights'],
-        #                                  'proposal')
+        if(cfg.DEBUG.DRAW_PROPOSAL_T):
+            self._draw_and_save_targets(frame,
+                                        self._proposal_targets['bbox_targets'],
+                                        self._proposal_targets['rois'],
+                                        self._proposal_targets['labels'],
+                                        self._proposal_targets['bbox_inside_weights'],
+                                        'proposal',
+                                        self._net_type)
         if(mode == 'VAL' or mode == 'TRAIN'):
             self._add_losses()  # compute losses
         if(mode == 'VAL' or mode == 'TEST'):
@@ -730,7 +753,7 @@ class Network(nn.Module):
     # only useful during testing mode
     def test_frame(self, frame, info):
         self.eval()
-        scale = info[4]
+        scale = info[6]
         with torch.no_grad():
             self.forward(frame, info, None, None, mode='TEST')
         cls_score, cls_prob, bbox_pred, rois = self._predictions["cls_score"].data.cpu().detach(), \
@@ -908,16 +931,34 @@ class Network(nn.Module):
                    for k, v in state_dict.items() if k in self.state_dict()}
             )
 
-    def _draw_and_save_lidar_targets(self,frame,info,targets,rois,labels,mask,target_type):
-        datapath = os.path.join(cfg.DATA_DIR, 'waymo','debug')
-        out_file = os.path.join(datapath,'{}_target_{}.png'.format(target_type,self._cnt))
-        #lidb = waymo_lidb()
-        #Extract voxel grid size
-        width   = int(info[1] - info[0] + 1)
-        #Y is along height axis in image domain
-        height  = int(info[3] - info[2] + 1)
-        #lidb._imheight = height
-        #lidb._imwidth  = width
+    """
+    Function: _draw_and_save_targets
+    Useful for debug, place within forward() loop. Allows visualization of anchor(1st stage) or proposal(2nd stage) targets over the voxelgrid/image array
+    Arguments:
+    ----------
+    frame       -> the input frame
+    info        -> size of the frame (x_min,x_max,y_min,y_max,z_min,z_max)
+    targets     -> (NxKx4 or NxKx7) where the targets are either for a 3d box or a 2d axis aligned box
+    rois        -> (Nx4) axis aligned rois (BEV or FV), either anchors (1st stage) or true ROI's (2nd stage)
+    labels      -> (N) label for each target
+    mask        -> (NxKx4 or NxKx7) dictating which bbox targets are to be used to transform ROI's (background dets do not have associated targets)
+    target_type -> anchor (1st stage) or proposal (2nd stage)
+    net_type    -> image or lidar
+    output:
+    -------
+    draws png files to a specific subfolder, dictated by cfg.DATA_DIR
+    """
+    def _draw_and_save_targets(self,frame,targets,rois,labels,mask,target_type,net_type):
+        datapath = os.path.join(cfg.DATA_DIR,'debug')
+        out_file = os.path.join(datapath,'{}_{}_target_{}.png'.format(self._cnt,target_type,net_type))
+        if(net_type == 'lidar'):
+            self._draw_and_save_lidar_targets(frame,targets,rois,labels,mask,target_type,out_file)
+        elif(net_type == 'image'):
+            self._draw_and_save_image_targets(frame,targets,rois,labels,mask,target_type,out_file)
+        print('Saving target file at location {}'.format(out_file))  
+        self._cnt += 1 
+
+    def _draw_and_save_lidar_targets(self,frame,targets,rois,labels,mask,target_type,out_file):
         voxel_grid = frame[0]
         voxel_grid_rgb = np.zeros((voxel_grid.shape[0],voxel_grid.shape[1],3))
         voxel_grid_rgb[:,:,0] = np.max(voxel_grid[:,:,0:cfg.LIDAR.NUM_SLICES],axis=2)
@@ -980,28 +1021,95 @@ class Network(nn.Module):
         img.save(out_file,'png')
         self._cnt += 1
 
+    def _draw_and_save_image_targets(self,frame,targets,rois,labels,mask,target_type,out_file):
+        frame = frame[0]*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
+        frame = frame.astype(dtype=np.uint8)
+        img = Image.fromarray(frame,'RGB')
+        draw = ImageDraw.Draw(img)
+        if(target_type == 'anchor'):
+            mask   = mask.view(-1,4)
+            labels = labels.permute(0,2,3,1).reshape(-1)
+        #if(target_type == 'anchor'):
+        if(target_type == 'proposal'):
+            #Target is in a (N,K*7) format, transform to (N,7) where corresponding label dictates what class bbox belongs to 
+            sel_targets = torch.where(labels == 0, targets[:,0:4],targets[:,4:8])
+            #Get subset of mask for specific class selected
+            mask = torch.where(labels == 0, mask[:,0:4], mask[:,4:8])
+            sel_targets = sel_targets*mask
+            rois = rois[:,1:5]
+            #Extract XC,YC and L,W
+            targets = sel_targets
+            stds = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_STDS[0:4]).unsqueeze(0).expand_as(targets)
+            means = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_MEANS[0:4]).unsqueeze(0).expand_as(targets)
+            targets = targets.mul(stds).add(means)
+        rois = rois.view(-1,4)
+        targets = targets.view(-1,4)
+        anchors = bbox_transform_inv(rois,targets)
+        label_mask = labels + 1
+        label_idx  = label_mask.nonzero().squeeze(1)
+        anchors_filtered = anchors[label_idx,:]
+        #else:
+        #    anchors = bbox_3d_transform_inv_all_boxes(anchors_3d,targets)
+            #anchors = 3d_to_bev(anchors)
+        for i, bbox in enumerate(anchors.view(-1,4)):
+            bbox_mask = mask[i]
+            bbox_label = int(labels[i])
+            roi        = rois[i]
+            np_bbox = None
+            #if(torch.mean(bbox_mask) > 0):
+            if(bbox_label == 1):
+                np_bbox = bbox.data.cpu().numpy()
+                draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
+                draw.rectangle(np_bbox,width=1,outline='green')
+                if(np_bbox[0] >= np_bbox[2]):
+                    print('x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
+                if(np_bbox[1] >= np_bbox[3]):
+                    print('y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
+            elif(bbox_label == 0):
+                np_bbox = roi.data.cpu().numpy()
+                draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
+                draw.rectangle(np_bbox,width=1,outline='red')
+                if(np_bbox[0] >= np_bbox[2]):
+                    print('x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
+                if(np_bbox[1] >= np_bbox[3]):
+                    print('y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
+        img.save(out_file,'png')
+
+
     """
-    Function: _draw_and_save_lidar_anchors
-    Useful for debug, place within forward() loop. Allows visualization of a subset of anchors over the voxelgrid array
+    Function: _draw_and_save_anchors
+    Useful for debug, place within forward() loop. Allows visualization of a subset of anchors over the voxelgrid/image array
     Arguments:
     ----------
-    frame   -> the voxel grid frame
-    info    -> size of the voxel grid frame (x_min,x_max,y_min,y_max,z_min,z_max)
-    anchors -> (Nx4) BEV axis aligned anchors
+    frame   -> the input frame
+    anchors -> (Nx4) axis aligned anchors (BEV or FV)
     output:
     -------
     draws png files to a specific subfolder, dictated by cfg.DATA_DIR
     """
-    def _draw_and_save_lidar_anchors(self,frame,info,anchors):
-        datapath = os.path.join(cfg.DATA_DIR, 'waymo','debug')
-        out_file = os.path.join(datapath,'{}.png'.format(self._cnt))
-        #lidb = waymo_lidb()
-        #Extract voxel grid size
-        width   = int(info[1] - info[0] + 1)
-        #Y is along height axis in image domain
-        height  = int(info[3] - info[2] + 1)
-        #lidb._imheight = height
-        #lidb._imwidth  = width
+    def _draw_and_save_anchors(self, frame, anchors, net_type):
+        datapath = os.path.join(cfg.DATA_DIR,'debug')
+        out_file = os.path.join(datapath,'{}_anchors_{}.png'.format(self._cnt,net_type))
+        if(net_type == 'lidar'):
+            img = self._draw_and_save_lidar_anchors(frame,anchors)
+        elif(net_type == 'image'):
+            img = self._draw_and_save_image_anchors(frame,anchors)
+        else:
+            print('Cannot draw and save anchors for net type: {}'.format(net_type))
+            img = None
+        draw = ImageDraw.Draw(img)
+        for i, bbox in enumerate(anchors.data.cpu().numpy()):
+            if(i%90 == 0):
+                draw.rectangle(bbox,width=1,outline=(255,0,0))
+            if(i%900 == 1):
+                draw.rectangle(bbox,width=1,outline=(0,255,0))
+            if(i%900 == 2):
+                draw.rectangle(bbox,width=1,outline=(0,0,255))
+        img.save(out_file,'png')
+        print('Saving file at location {}'.format(out_file))  
+        self._cnt += 1 
+
+    def _draw_and_save_lidar_anchors(self,frame,anchors):
         voxel_grid = frame[0]
         voxel_grid_rgb = np.zeros((voxel_grid.shape[0],voxel_grid.shape[1],3))
         voxel_grid_rgb[:,:,0] = np.max(voxel_grid[:,:,0:cfg.LIDAR.NUM_SLICES],axis=2)
@@ -1012,14 +1120,10 @@ class Network(nn.Module):
         voxel_grid_rgb[:,:,2] = voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1]*(255/voxel_grid[:,:,cfg.LIDAR.NUM_SLICES+1].max())
         voxel_grid_rgb        = voxel_grid_rgb.astype(dtype='uint8')
         img = Image.fromarray(voxel_grid_rgb,'RGB')
-        draw = ImageDraw.Draw(img)
-        for i, bbox in enumerate(anchors.data.cpu().numpy()):
-            if(i%90 == 0):
-                draw.rectangle(bbox,width=1,outline=(255,0,0))
-            if(i%900 == 1):
-                draw.rectangle(bbox,width=1,outline=(0,255,0))
-            if(i%90 == 2):
-                draw.rectangle(bbox,width=1,outline=(0,0,255))
-        print('Saving BEV map file at location {}'.format(out_file))
-        img.save(out_file,'png')
-        self._cnt += 1
+        return img
+
+    def _draw_and_save_image_anchors(self,frame,anchors):
+        frame = frame[0]*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
+        frame = frame.astype(dtype=np.uint8)
+        source_img = Image.fromarray(frame)
+        return source_img
