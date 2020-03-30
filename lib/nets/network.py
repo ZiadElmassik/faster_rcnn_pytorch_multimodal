@@ -25,7 +25,7 @@ from layer_utils.snippets import generate_anchors_pre
 from layer_utils.generate_3d_anchors import GridAnchor3dGenerator
 from layer_utils.proposal_layer import proposal_layer
 from layer_utils.proposal_top_layer import proposal_top_layer
-from layer_utils.anchor_target_layer import anchor_target_layer
+from layer_utils.anchor_target_layer import anchor_target_layer, anchor_target_layer_torch
 from layer_utils.proposal_target_layer import proposal_target_layer
 from utils.visualization import draw_bounding_boxes
 from model.bbox_transform import bbox_transform_inv, lidar_bbox_transform_inv, clip_boxes
@@ -60,6 +60,8 @@ class Network(nn.Module):
         self._variables_to_fix = {}
         self._device = 'cuda'
         self._cum_loss_keys = ['total_loss','rpn_cross_entropy','rpn_loss_box','cross_entropy','loss_box']
+        if(cfg.NET_TYPE == 'lidar'):
+            self._cum_loss_keys.append('ry_loss')
         if(cfg.ENABLE_ALEATORIC_CLS_VAR):
             self._cum_loss_keys.append('a_cls_var')
             self._cum_loss_keys.append('a_cls_entropy')
@@ -132,26 +134,24 @@ class Network(nn.Module):
         # map of shape (..., H, W)
         height, width = rpn_cls_score.data.shape[1:3]
 
-        gt_boxes = self._gt_boxes.data.cpu().numpy()
-        gt_boxes_dc = self._gt_boxes_dc.data.cpu().numpy()
+        #gt_boxes = self._gt_boxes.data.cpu().numpy()
+        #gt_boxes_dc = self._gt_boxes_dc.data.cpu().numpy()
 
         #.data is used to pull a tensor from a pytorch variable. Deprecated, but it grabs a copy of the data that will not be tracked by gradients
         rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = \
-            anchor_target_layer(gt_boxes, gt_boxes_dc, self._info, self._feat_stride, self._anchors.data.cpu().numpy(), self._num_anchors, height, width)
+            anchor_target_layer_torch(self._gt_boxes, self._gt_boxes_dc, self._info, self._feat_stride, self._anchors, self._num_anchors, height, width, self._device)
             # bbox_outside_weights
 
-        rpn_labels = torch.from_numpy(rpn_labels).float().to(
-            self._device)  #.set_shape([1, 1, None, None])
-        rpn_bbox_targets = torch.from_numpy(rpn_bbox_targets).float().to(
-            self._device)  #.set_shape([1, None, None, self._num_anchors * 4])
-        rpn_bbox_inside_weights = torch.from_numpy(
-            rpn_bbox_inside_weights).float().to(
-                self.
-                _device)  #.set_shape([1, None, None, self._num_anchors * 4])
-        rpn_bbox_outside_weights = torch.from_numpy(
-            rpn_bbox_outside_weights).float().to(
-                self.
-                _device)  #.set_shape([1, None, None, self._num_anchors * 4])
+        #rpn_labels = torch.from_numpy(rpn_labels).float().to(
+        #    self._device)  #.set_shape([1, 1, None, None])
+        #rpn_bbox_targets = torch.from_numpy(rpn_bbox_targets).float().to(
+        #    self._device)  #.set_shape([1, None, None, self._num_anchors * 4])
+        #rpn_bbox_inside_weights = torch.from_numpy(
+        #    rpn_bbox_inside_weights).float().to(
+        #        self._device)  #.set_shape([1, None, None, self._num_anchors * 4])
+        #rpn_bbox_outside_weights = torch.from_numpy(
+        #    rpn_bbox_outside_weights).float().to(
+        #        self._device)  #.set_shape([1, None, None, self._num_anchors * 4])
 
         rpn_labels = rpn_labels.long()
         self._anchor_targets['rpn_labels']               = rpn_labels
@@ -233,10 +233,10 @@ class Network(nn.Module):
             #TODO: Sum across elements
             loss_box = self._huber_loss(bbox_pred_aa,targets_aa,1.0,sigma)
             #TODO: Do i need to compute the sin of the difference here?
-            sin_pred = torch.sin(bbox_pred.reshape(-1,7)[:,6:7].reshape(-1,elem_rm))
-            sin_targets = torch.sin(bbox_targets.reshape(-1,7)[:,6:7].reshape(-1,elem_rm))
+            sin_pred = bbox_pred.reshape(-1,7)[:,6:7].reshape(-1,elem_rm)
+            sin_targets = bbox_targets.reshape(-1,7)[:,6:7].reshape(-1,elem_rm)
             ry_loss = self._huber_loss(sin_pred,sin_targets,1.0/9.0,sigma)
-
+            self._losses['ry_loss'] = torch.mean(torch.sum(ry_loss,dim=1))
             in_loss_box = torch.cat((loss_box.reshape(-1,6),ry_loss.reshape(-1,1)),dim=1).reshape(-1,bbox_shape[1])
             #bbox_outside_weights = torch.mean(bbox_outside_weights,axis=1)
         else:
@@ -486,9 +486,9 @@ class Network(nn.Module):
                 rpn_cls_prob, rpn_bbox_pred)  # rois, roi_scores are varible
             #self.timers['proposal'].toc()
             #targets for first stage loss computation (against the RPN predictions)
-            self.timers['anchor_t'].tic()
+            #self.timers['anchor_t'].tic()
             self._anchor_target_layer(rpn_cls_score)
-            self.timers['anchor_t'].toc()
+            #self.timers['anchor_t'].toc()
             #N.B. - ROI's passed into proposal_target_layer have been pre-transformed and are true bounding boxes
             #Generate final detection targets from ROI's generated from the RPN
             #self.timers['proposal_t'].tic()
@@ -553,8 +553,8 @@ class Network(nn.Module):
         # Add image gt
         if(self._net_type == 'image'):
             summaries.append(self._add_gt_image_summary())
-        elif(self._net_type == 'lidar'):
-            print('vg summaries on tensorboard not supported yet.')
+        #elif(self._net_type == 'lidar'):
+        #    print('vg summaries on tensorboard not supported yet.')
         # Add event_summaries
         if not val:
             for key, var in self._event_summaries.items():
@@ -601,7 +601,7 @@ class Network(nn.Module):
 
     def _predict(self):
         # This is just _build_network in tf-faster-rcnn
-        self.timers['net'].tic()
+        #self.timers['net'].tic()
         torch.backends.cudnn.benchmark = False
         net_conv = self._input_to_head(self._frame)
         #print(net_conv)
@@ -639,7 +639,7 @@ class Network(nn.Module):
             fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
 
         self._region_classification(fc7)
-        self.timers['net'].toc()
+        #self.timers['net'].toc()
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
 
@@ -663,6 +663,8 @@ class Network(nn.Module):
             #gt_boxes      = bbox_utils.bbox_bev_to_voxel_grid(gt_boxes,self._bev_extants,info)
             gt_boxes      = np.concatenate((gt_boxes, gt_box_labels),axis=1)
             #Still in 3D format
+            #bev_extents   = [cfg.LIDAR.X_RANGE[0],cfg.LIDAR.Y_RANGE[0],cfg.LIDAR.Z_RANGE[0],cfg.LIDAR.X_RANGE[1],cfg.LIDAR.Y_RANGE[1],cfg.LIDAR.Z_RANGE[1]]
+            #bev_gt_bboxes = bbox_utils.bbox_voxel_grid_to_pc(gt_bboxes,bev_extents,info)
             true_gt_boxes = np.concatenate((gt_bboxes, gt_box_labels),axis=1)
             #Dont care areas
             #gt_boxes_dc   = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_boxes_dc)
@@ -707,8 +709,11 @@ class Network(nn.Module):
                                         self._proposal_targets['bbox_inside_weights'],
                                         'proposal',
                                         self._net_type)
+
         if(mode == 'VAL' or mode == 'TRAIN'):
+            #self.timers['losses'].tic()
             self._add_losses()  # compute losses
+            #self.timers['losses'].toc()
         if(mode == 'VAL' or mode == 'TEST'):
             bbox_pred = self._predictions['bbox_pred']
             #bbox_targets are pre-normalized for loss, so modifying here.
@@ -868,7 +873,9 @@ class Network(nn.Module):
         #.item() converts single element of type pytorch.tensor to a primitive float/int
         loss = self._losses['total_loss'].item()
         #utils.timer.timer.tic('backward')
+        #self.timers['backprop'].tic()
         self._losses['total_loss'].backward()
+        #self.timers['backprop'].toc()
         #utils.timer.timer.toc('backward')
         for key in self._cum_loss_keys:
             if(key in self._cum_losses):
