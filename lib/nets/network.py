@@ -62,13 +62,16 @@ class Network(nn.Module):
         self._device           = 'cuda'
         self._cum_loss_keys    = ['total_loss','rpn_cross_entropy','rpn_loss_box']
         #self._cum_loss_keys    = ['total_loss','rpn_cross_entropy','rpn_loss_box','cross_entropy','loss_box']
-        if(cfg.NET_TYPE == 'lidar' and cfg.ENABLE_FULL_NET):
-            self._cum_loss_keys.append('ry_loss')
-        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
-            self._cum_loss_keys.append('a_cls_var')
-            self._cum_loss_keys.append('a_cls_entropy')
-        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            self._cum_loss_keys.append('a_bbox_var')
+        if(cfg.ENABLE_FULL_NET):
+            self._cum_loss_keys.append('loss_box')
+            self._cum_loss_keys.append('cross_entropy')
+            if(cfg.NET_TYPE == 'lidar'):
+                self._cum_loss_keys.append('ry_loss')
+            if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+                self._cum_loss_keys.append('a_cls_var')
+                self._cum_loss_keys.append('a_cls_entropy')
+            if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+                self._cum_loss_keys.append('a_bbox_var')
         self._cum_gt_entries                  = 0
         self._batch_gt_entries                = 0
         self._cum_im_entries                  = 0
@@ -237,7 +240,8 @@ class Network(nn.Module):
             loss_box     = self._huber_loss(bbox_pred_aa,targets_aa,1.0,sigma)
             #TODO: Do i need to compute the sin of the difference here?
             sin_pred     = bbox_pred.reshape(-1,7)[:,6:7].reshape(-1,elem_rm)
-            sin_targets  = torch.sin(bbox_targets.reshape(-1,7)[:,6:7].reshape(-1,elem_rm))
+            #Convert to sin to normalize, targets will be in degrees off of anchor
+            sin_targets  = bbox_targets.reshape(-1,7)[:,6:7].reshape(-1,elem_rm)
             ry_loss      = self._huber_loss(sin_pred,sin_targets,1.0/9.0,sigma)
             self._losses['ry_loss'] = torch.mean(torch.sum(ry_loss,dim=1))
             in_loss_box  = torch.cat((loss_box.reshape(-1,6),ry_loss.reshape(-1,1)),dim=1).reshape(-1,bbox_shape[1])
