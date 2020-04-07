@@ -190,6 +190,8 @@ class Network(nn.Module):
             anchors, anchor_length = generate_anchors_pre(\
                                                 height, width,
                                                 self._feat_stride, self._anchor_scales, self._anchor_ratios)
+            #TODO: Unused, shouldn't use unless lidar. fix please.
+            self._anchors_3d = torch.from_numpy(anchors).to(self._device)
         elif(self._net_type == 'lidar'):
             anchor_generator = GridAnchor3dGenerator()
             anchor_length, anchors = anchor_generator._generate(height, width, self._feat_stride, self._anchor_scales, self._anchor_ratios)
