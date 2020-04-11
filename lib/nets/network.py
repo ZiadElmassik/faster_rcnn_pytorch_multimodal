@@ -28,7 +28,7 @@ from layer_utils.proposal_top_layer import proposal_top_layer
 from layer_utils.anchor_target_layer import anchor_target_layer, anchor_target_layer_torch
 from layer_utils.proposal_target_layer import proposal_target_layer
 from utils.visualization import draw_bounding_boxes
-from model.bbox_transform import bbox_transform_inv, lidar_bbox_transform_inv, lidar_3d_bbox_transform_inv, clip_boxes
+from model.bbox_transform import bbox_transform_inv, lidar_3d_bbox_transform_inv, clip_boxes
 
 from torchvision.ops import RoIAlign, RoIPool
 from torchvision import transforms
@@ -201,9 +201,11 @@ class Network(nn.Module):
         self._anchors = torch.from_numpy(anchors).to(self._device)
         self._anchor_length = anchor_length
 
-    def _huber_loss(self,pred, targets, huber_delta, sigma):
+    def _huber_loss(self,pred, targets, huber_delta, sigma, sin_en=False):
         sigma_2 = sigma**2
         box_diff = pred - targets
+        if(sin_en):
+            box_diff = torch.sin(box_diff)
         abs_in_box_diff = torch.abs(box_diff)
         smoothL1_sign = (abs_in_box_diff < huber_delta / sigma_2).detach().float()
         above_one = (abs_in_box_diff - (0.5 * huber_delta / sigma_2)) * (1. - smoothL1_sign)
@@ -244,7 +246,7 @@ class Network(nn.Module):
             sin_pred     = bbox_pred.reshape(-1,7)[:,6:7].reshape(-1,elem_rm)
             #Convert to sin to normalize, targets will be in degrees off of anchor
             sin_targets  = bbox_targets.reshape(-1,7)[:,6:7].reshape(-1,elem_rm)
-            ry_loss      = self._huber_loss(sin_pred,sin_targets,1.0/9.0,sigma)
+            ry_loss      = self._huber_loss(sin_pred,sin_targets,1.0/9.0,sigma,sin_en=True)
             self._losses['ry_loss'] = torch.mean(torch.sum(ry_loss,dim=1))
             in_loss_box  = torch.cat((loss_box.reshape(-1,6),ry_loss.reshape(-1,1)),dim=1).reshape(-1,bbox_shape[1])
             #bbox_outside_weights = torch.mean(bbox_outside_weights,axis=1)
@@ -512,9 +514,9 @@ class Network(nn.Module):
             #self.timers['proposal_t'].toc()
         else:
             if cfg.TEST.MODE == 'nms':
-                rois, _, anchors_3d = self._proposal_layer(rpn_cls_prob, rpn_bbox_pred)
+                rois, roi_scores, anchors_3d = self._proposal_layer(rpn_cls_prob, rpn_bbox_pred)
             elif cfg.TEST.MODE == 'top':
-                rois, _, anchors_3d = self._proposal_top_layer(rpn_cls_prob, rpn_bbox_pred)
+                rois, roi_scores, anchors_3d = self._proposal_top_layer(rpn_cls_prob, rpn_bbox_pred)
             else:
                 raise NotImplementedError
 
@@ -671,24 +673,25 @@ class Network(nn.Module):
         scale = info[6]
         self._frame = torch.from_numpy(frame.transpose([0, 3, 1,
                                                         2])).to(self._device)
-        if(self._net_type == 'image'):
-            true_gt_boxes = gt_boxes
+        if(mode == 'TRAIN' or mode == 'VAL'):
+            if(self._net_type == 'image'):
+                true_gt_boxes = gt_boxes
 
-        elif(self._net_type == 'lidar'):
-            #TODO: Should info contain bev extants? Seems like the cleanest way
-            gt_box_labels = gt_boxes[:, -1, np.newaxis]
-            gt_bboxes     = gt_boxes[:, :-1]
-            gt_boxes      = bbox_utils.bbaa_graphics_gems(gt_bboxes,info[1],info[3])
-            #gt_boxes      = bbox_utils.bbox_bev_to_voxel_grid(gt_boxes,self._bev_extants,info)
-            gt_boxes      = np.concatenate((gt_boxes, gt_box_labels),axis=1)
-            #Still in 3D format
-            #bev_extents   = [cfg.LIDAR.X_RANGE[0],cfg.LIDAR.Y_RANGE[0],cfg.LIDAR.Z_RANGE[0],cfg.LIDAR.X_RANGE[1],cfg.LIDAR.Y_RANGE[1],cfg.LIDAR.Z_RANGE[1]]
-            #bev_gt_bboxes = bbox_utils.bbox_voxel_grid_to_pc(gt_bboxes,bev_extents,info)
-            true_gt_boxes = np.concatenate((gt_bboxes, gt_box_labels),axis=1)
-            #Dont care areas
-            #gt_boxes_dc   = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_boxes_dc)
-            gt_boxes_dc = None
-            #gt_boxes_dc   = bbox_utils.bbox_bev_to_voxel_grid(gt_boxes,self._bev_extants,info)
+            elif(self._net_type == 'lidar'):
+                #TODO: Should info contain bev extants? Seems like the cleanest way
+                gt_box_labels = gt_boxes[:, -1, np.newaxis]
+                gt_bboxes     = gt_boxes[:, :-1]
+                gt_boxes      = bbox_utils.bbaa_graphics_gems(gt_bboxes,info[1],info[3])
+                gt_boxes      = np.concatenate((gt_boxes, gt_box_labels),axis=1)
+                #Still in 3D format
+                true_gt_boxes = np.concatenate((gt_bboxes, gt_box_labels),axis=1)
+                #Dont care areas
+                #gt_boxes_dc   = bbox_utils.bbox_3d_to_bev_axis_aligned(gt_boxes_dc)
+                gt_boxes_dc = None
+                #gt_boxes_dc   = bbox_utils.bbox_bev_to_voxel_grid(gt_boxes,self._bev_extants,info)
+        else:
+            true_gt_boxes = None
+        
 
         self._true_gt_boxes = torch.from_numpy(true_gt_boxes).to(
             self._device) if true_gt_boxes is not None else None
@@ -765,9 +768,6 @@ class Network(nn.Module):
                     if(self._net_type == 'image'):
                         mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,scale)
                     elif(self._net_type == 'lidar'):
-                        #roi_height = cfg.LIDAR.ANCHORS[0][2]
-                        #roi_zc     = cfg.LIDAR.ANCHORS[0][2]/2
-                        #mean_bbox_inv = lidar_bbox_transform_inv(rois,roi_height,roi_zc,bbox_mean,scale)
                         mean_bbox_inv = lidar_3d_bbox_transform_inv(self._predictions['anchors_3d'],bbox_mean,scale)
                     
                     self._predictions['bbox_inv_pred'] = mean_bbox_inv
@@ -792,10 +792,9 @@ class Network(nn.Module):
                                                          self._predictions['cls_prob'].data.detach(), \
                                                          self._predictions['bbox_inv_pred'].data.detach(), \
                                                          self._predictions['rois'].data.detach()
-
-        a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,scale)
-
-        return cls_score, cls_prob, a_cls_entropy, a_cls_var, e_cls_mutual_info, bbox_pred, a_bbox_var, e_bbox_var, rois
+        #a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info
+        uncertainties = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,scale)
+        return cls_score, cls_prob, bbox_pred, rois, uncertainties
 
     def delete_intermediate_states(self):
         # Delete intermediate result to save memory
