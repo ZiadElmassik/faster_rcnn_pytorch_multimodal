@@ -77,7 +77,6 @@ class Network(nn.Module):
         self._cum_im_entries                  = 0
         self._num_mc_run                      = 1
         self._num_aleatoric_samples           = cfg.NUM_ALEATORIC_SAMPLE
-        self._bev_extents                     = [cfg.LIDAR.X_RANGE,cfg.LIDAR.Y_RANGE,cfg.LIDAR.Z_RANGE]
         self._net_type                        = cfg.NET_TYPE
         #Set on every forward pass for use with proposal target layer
         self._gt_boxes      = None
