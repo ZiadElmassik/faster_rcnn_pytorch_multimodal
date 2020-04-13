@@ -87,8 +87,10 @@ class Network(nn.Module):
         # add back mean
         image = ((self._gt_summaries['frame']))*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
         #Flip info from (xmin,xmax,ymin,ymax) to (ymin,ymax,xmin,xmax) due to frame being rotated
-        frame_range = [self._info[3] - self._info[2] + 1, self._info[1] - self._info[0] + 1]
-        image = imresize(image[0], frame_range / self._info[6])
+        frame_range = np.asarray([self._info[3] - self._info[2] + 1, self._info[1] - self._info[0] + 1])
+        resized = frame_range / self._info[6]
+        resized = resized.astype(dtype=np.int64)
+        image = imresize(image[0], resized)
         # BGR to RGB (opencv uses BGR)
         #print(image)
         #image = image[:,:,:,cfg.PIXEL_ARRANGE]
