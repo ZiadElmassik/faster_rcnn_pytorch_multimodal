@@ -584,17 +584,17 @@ class Network(nn.Module):
             #Reset summary val
             self._event_summaries = {}
             # Add score summaries
-            for key, var in self._score_summaries.items():
-                summaries.append(self._add_score_summary(key, var))
+            #for key, var in self._score_summaries.items():
+            #    summaries.append(self._add_score_summary(key, var))
             self._score_summaries = {}
             # Add act summaries
-            for key, var in self._act_summaries.items():
-                summaries += self._add_act_summary(key, var)
+            #for key, var in self._act_summaries.items():
+            #    summaries += self._add_act_summary(key, var)
             self._act_summaries = {}
             # Add train summaries
-            for k, var in dict(self.named_parameters()).items():
-                if var.requires_grad:
-                    summaries.append(self._add_train_summary(k, var))
+            #for k, var in dict(self.named_parameters()).items():
+            #    if var.requires_grad:
+            #        summaries.append(self._add_train_summary(k, var))
 
             self._gt_summaries = {}
         else:
@@ -991,7 +991,9 @@ class Network(nn.Module):
     draws png files to a specific subfolder, dictated by cfg.DATA_DIR
     """
     def _draw_and_save_targets(self,frame,targets,rois,anchors_3d,labels,mask,target_type,net_type):
-        datapath = os.path.join(cfg.DATA_DIR,'debug')
+        datapath = os.path.join(cfg.ROOT_DIR,'debug')
+        if not os.path.isdir(datapath):
+            os.mkdir(datapath)
         if(target_type == 'anchor'):
            cnt = self._anchor_cnt
         elif(target_type == 'proposal'):
@@ -1143,7 +1145,9 @@ class Network(nn.Module):
     draws png files to a specific subfolder, dictated by cfg.DATA_DIR
     """
     def _draw_and_save_anchors(self, frame, anchors, net_type):
-        datapath = os.path.join(cfg.DATA_DIR,'debug')
+        datapath = os.path.join(cfg.ROOT_DIR,'debug')
+        if not os.path.isdir(datapath):
+            os.mkdir(datapath)
         out_file = os.path.join(datapath,'{}_anchors_{}.png'.format(self._cnt,net_type))
         if(net_type == 'lidar'):
             img = self._draw_and_save_lidar_anchors(frame,anchors)
