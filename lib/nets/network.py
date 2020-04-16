@@ -27,9 +27,10 @@ from layer_utils.proposal_top_layer import proposal_top_layer
 from layer_utils.anchor_target_layer import anchor_target_layer
 from layer_utils.proposal_target_layer import proposal_target_layer
 from utils.visualization import draw_bounding_boxes
+from model.bbox_transform import bbox_transform_inv, clip_boxes
 
 from torchvision.ops import RoIAlign, RoIPool
-
+from torchvision import transforms
 from model.config import cfg
 
 import tensorboardX as tb
@@ -41,8 +42,16 @@ class Network(nn.Module):
     def __init__(self):
         nn.Module.__init__(self)
         self._predictions = {}
+        self._mc_run_output = {}
+        self._mc_run_results = {}
         self._losses = {}
         self._cum_losses = {}
+        self._cum_loss_keys = ['total_loss','rpn_cross_entropy','rpn_loss_box','cross_entropy','loss_box']
+        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+            self._cum_loss_keys.append('a_cls_var')
+            self._cum_loss_keys.append('a_cls_entropy')
+        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            self._cum_loss_keys.append('a_bbox_var')
         self._anchor_targets = {}
         self._proposal_targets = {}
         self._layers = {}
@@ -55,14 +64,11 @@ class Network(nn.Module):
         self._cnt = 0
         self._variables_to_fix = {}
         self._device = 'cuda'
-        self._cum_losses['total_loss']        = 0
-        self._cum_losses['rpn_cross_entropy'] = 0
-        self._cum_losses['rpn_loss_box']      = 0
-        self._cum_losses['cross_entropy']     = 0
-        self._cum_losses['loss_box']          = 0
         self._cum_gt_entries                  = 0
         self._batch_gt_entries                = 0
         self._cum_im_entries                  = 0
+        self._num_mc_run                      = 1
+        self._num_aleatoric_samples           = cfg.NUM_ALEATORIC_SAMPLE
         #Set on every forward pass for use with proposal target layer
         self._gt_boxes = None
         self._gt_boxes_dc = None
@@ -115,7 +121,9 @@ class Network(nn.Module):
                                          self._feat_stride, self._anchors, self._num_anchors)
         return rois, rpn_scores
 
+    #FYI this is a fancy way of instantiating a class and calling its main function
     def _roi_pool_layer(self, bottom, rois):
+        #Has restriction on batch, only one dim allowed
         return RoIPool((cfg.POOLING_SIZE, cfg.POOLING_SIZE),
                        1.0 / 16.0)(bottom, rois)
 
@@ -175,25 +183,45 @@ class Network(nn.Module):
                                               height, width,
                                                self._feat_stride, self._anchor_scales, self._anchor_ratios)
         self._anchors = torch.from_numpy(anchors).to(self._device)
+        self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
         self._anchor_length = anchor_length
 
     def _smooth_l1_loss(self,
+                        stage,
                         bbox_pred,
                         bbox_targets,
+                        bbox_var,
                         bbox_inside_weights,
                         bbox_outside_weights,
                         sigma=1.0,
                         dim=[1]):
         sigma_2 = sigma**2
+        if((stage == 'RPN' and cfg.ENABLE_RPN_BBOX_VAR) or (stage == 'DET' and cfg.ENABLE_ALEATORIC_BBOX_VAR)):
+            bbox_var_en = True
+        else:
+            bbox_var_en = False
         box_diff = bbox_pred - bbox_targets
         #print(bbox_targets.size())
         #print(bbox_pred.size())
         #Ignore diff when target is not a foreground target
+        # a mask array for the foreground anchors (called “bbox_inside_weights”) is used to calculate the loss as a vector operation and avoid for-if loops.
         in_box_diff = bbox_inside_weights * box_diff
+        torch.set_printoptions(profile="full")
+        #print('from _smooth_l1_loss')
+        #print(bbox_targets)
+        torch.set_printoptions(profile="default")
         abs_in_box_diff = torch.abs(in_box_diff)
         smoothL1_sign = (abs_in_box_diff < 1. / sigma_2).detach().float()
         in_loss_box = torch.pow(in_box_diff, 2) * (sigma_2 / 2.) * smoothL1_sign + (abs_in_box_diff - (0.5 / sigma_2)) * (1. - smoothL1_sign)
-        #Used to normalize the predictions?
+        #Used to normalize the predictions, this is only used in the RPN
+        #By default negative(background) and positive(foreground) samples have equal weighting
+        if(bbox_var_en):
+            #Don't need covariance matrix as it collapses itself in the end anyway
+            #eye = torch.eye().repeat(in_var.shape[0])
+            #torch.set_printoptions(profile="full")
+            #torch.set_printoptions(profile="default")
+            in_loss_box = 0.5*in_loss_box*torch.exp(-bbox_var) + 0.5*torch.exp(bbox_var)
+            in_loss_box = in_loss_box*bbox_inside_weights
         out_loss_box = bbox_outside_weights * in_loss_box
         loss_box = out_loss_box
         #Condense down to 1D array, each entry is the box_loss for an individual box, array is batch size of all predicted boxes
@@ -226,6 +254,7 @@ class Network(nn.Module):
 
         # RPN, bbox loss
 
+        #Pretty sure these are delta's at this point
         rpn_bbox_pred = self._predictions['rpn_bbox_pred']
         rpn_bbox_targets = self._anchor_targets['rpn_bbox_targets']
         rpn_bbox_inside_weights = self._anchor_targets[
@@ -233,44 +262,163 @@ class Network(nn.Module):
         rpn_bbox_outside_weights = self._anchor_targets[
             'rpn_bbox_outside_weights']
         rpn_loss_box = self._smooth_l1_loss(
+            'RPN',
             rpn_bbox_pred,
             rpn_bbox_targets,
+            [],
             rpn_bbox_inside_weights,
             rpn_bbox_outside_weights,
             sigma=sigma_rpn,
             dim=[1, 2, 3])
-
-        # RCNN, class loss
-        cls_score = self._predictions["cls_score"]
-        label = self._proposal_targets["labels"].view(-1)
-        cross_entropy = F.cross_entropy(
-            cls_score.view(-1, self._num_classes), label)
-
+        # RCNN, class loss, performed on class score logits
+        cls_score = self._predictions['cls_score']
+        cls_prob  = self._predictions['cls_prob']
+        label = self._proposal_targets['labels'].view(-1)
         # RCNN, bbox loss
         bbox_pred = self._predictions['bbox_pred']
+        #This should read bbox_target_deltas
         bbox_targets = self._proposal_targets['bbox_targets']
         bbox_inside_weights = self._proposal_targets['bbox_inside_weights']
         bbox_outside_weights = self._proposal_targets['bbox_outside_weights']
-        loss_box = self._smooth_l1_loss(
-            bbox_pred, bbox_targets, bbox_inside_weights, bbox_outside_weights)
-
+        #Flag to only handle a_bbox_var if enabled
+        #Compute aleatoric class entropy
+        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+            a_cls_var  = self._predictions['a_cls_var']
+            cross_entropy, a_cls_mutual_info = self._bayesian_cross_entropy(cls_score, a_cls_var, label,cfg.NUM_CE_SAMPLE)
+            self._losses['a_cls_entropy'] = torch.mean(a_cls_mutual_info)
+            self._losses['a_cls_var']     = torch.mean(a_cls_var)
+            #Classical entropy w/out logit sampling
+            #self._losses['a_cls_entropy'] = torch.mean(self._categorical_entropy(cls_prob))
+        else:
+            cross_entropy = F.cross_entropy(cls_score, label)
+            self._losses['a_cls_entropy'] = torch.tensor(0)
+        #Compute aleatoric bbox variance
+        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            #Grab a local variable for a_bbox_var
+            a_bbox_var  = self._predictions['a_bbox_var']
+            #network output comes out as log(a_bbox_var), so it needs to be adjusted
+            #TODO: Should i only care about top output variance? Thats what bbox_inside_weights does
+            self._losses['a_bbox_var'] = (torch.exp(a_bbox_var)*bbox_inside_weights).mean()
+        else:
+            a_bbox_var = None
+            self._losses['a_bbox_var'] = torch.tensor(0)
+        #Compute loss box
+        loss_box = self._smooth_l1_loss('DET', bbox_pred, bbox_targets, a_bbox_var, bbox_inside_weights, bbox_outside_weights)
+        #Assign computed losses to be tracked in tensorboard
         self._losses['cross_entropy'] = cross_entropy
         self._losses['loss_box'] = loss_box
         self._losses['rpn_cross_entropy'] = rpn_cross_entropy
         self._losses['rpn_loss_box'] = rpn_loss_box
-        #Computed losses
+        #Total loss
         loss = cross_entropy + loss_box + rpn_cross_entropy + rpn_loss_box
         self._losses['total_loss'] = loss
-        #print('individual image loss:{:f}'.format(loss))
-        #if(loss > 1):
-        #    torch.set_printoptions(profile="full")
-        #    print('loss {}'.format(loss))
-            #print('labels: {}'.format(label))
-            #print('class score: {}'.format(cls_score))
-            #print('bbox targets: {}'.format(bbox_targets))
-            #print('bbox pred: {}'.format(bbox_pred))
-        #    torch.set_printoptions(profile="default")
         return loss
+
+    def _compute_bbox_cov(self,bbox_samples):
+        mc_bbox_mean = torch.mean(bbox_samples,dim=0)
+        mc_bbox_pred = bbox_samples.unsqueeze(3)
+        mc_bbox_var = torch.mean(torch.matmul(mc_bbox_pred,mc_bbox_pred.transpose(2,3)),dim=0)
+        mc_bbox_mean = mc_bbox_mean.unsqueeze(2)
+        mc_bbox_var = mc_bbox_var - torch.matmul(mc_bbox_mean,mc_bbox_mean.transpose(1,2))
+        mc_bbox_var = mc_bbox_var*torch.eye(mc_bbox_var.shape[-1]).cuda()
+        mc_bbox_var = torch.sum(mc_bbox_var,dim=-1)
+        #mc_bbox_var = torch.diag_embed(mc_bbox_var,offset=0,dim1=1,dim2=2)
+        return mc_bbox_var.clamp_min(0.0)
+
+    def _compute_bbox_var(self,bbox_samples):
+        n = bbox_samples.shape[0]
+        mc_bbox_mean = torch.pow(torch.sum(bbox_samples,dim=0),2)
+        mc_bbox_var = torch.sum(torch.pow(bbox_samples,2),dim=0)
+        mc_bbox_var += -mc_bbox_mean/n
+        mc_bbox_var = mc_bbox_var/(n-1)
+        return mc_bbox_var.clamp_min(0.0)
+
+    def _categorical_entropy(self,cls_prob):
+        #Compute entropy for each class(y=c)
+        cls_entropy = cls_prob*torch.log(cls_prob)
+        #Sum across classes
+        total_entropy = -torch.sum(cls_entropy,dim=1)
+        #true_cls      = torch.gather(cls_score,1,labels.unsqueeze(1)).squeeze(1)
+        #softmax = torch.exp(true_cls)/torch.mean(torch.exp(cls_score),dim=1)
+        return total_entropy
+    #input: cls_score (T,N,C) T-> Samples, N->Batch, C-> Classes
+    def _categorical_mutual_information(self,cls_score):
+        cls_prob = F.softmax(cls_score,dim=2)
+        avg_cls_prob = torch.mean(cls_prob,dim=0)
+        total_entropy = self._categorical_entropy(avg_cls_prob)
+        #Take sum of entropy across classes
+        mutual_info = torch.sum(cls_prob*torch.log(cls_prob),dim=2)
+        #Get expectation over T forward passes
+        mutual_info = torch.mean(mutual_info,dim=0)
+        mutual_info += total_entropy
+        return mutual_info.clamp_min(0.0)
+
+    def _bayesian_cross_entropy(self,cls_score,cls_var,targets,num_sample):
+        
+
+
+        #cls_var comes in as true variance. Network output is log(var) but exp is applied at network output.
+        #true_var       = torch.gather(cls_var,1,targets.unsqueeze(1)).squeeze(1)
+        #undistorted_ce = F.cross_entropy(cls_score, targets,reduction='none')
+
+        #Distorted loss - generate a normal distribution.
+        #Change where it is sampled from? Maybe from output of CE?
+        #preprocess
+
+        #cls_score_mask = torch.zeros((cls_score.shape[0],cls_score.shape[1]),device='cuda').scatter(1, targets, 1)
+        #for i,mask_row in enumerate(cls_score_mask):
+        #    mask_row[targets[i]] = 1
+        cls_score_mask = torch.zeros_like(cls_score).scatter_(1, targets.unsqueeze(1), 1)
+        cls_score_shifted = cls_score + cls_score_mask
+        #for i in range(cls_score.shape[0]):
+        #    for j in range(cls_score.shape[1]):
+        #        if(targets[i] == j):
+        #            cls_score_shifted[i,j] = cls_score[i,j] + 1
+        #        else:
+        #            cls_score_shifted[i,j] = cls_score[i,j]
+
+        #cls_score[:,targets] = cls_score[:,targets] + 1
+        #cls_score_shifted = torch.zeros((cls_score.shape[0],cls_score.shape[1],device='cuda').scatter_()
+        #cls_score_shifted = cls_score[:,targets] + 1
+        #Step 1: Get a set of distorted logits sampled from a gaussian distribution
+        distribution     = torch.distributions.Normal(0,torch.sqrt(cls_var))
+        cls_score_resize = cls_score_shifted.repeat(num_sample,1,1)
+        logit_samples    = distribution.sample((num_sample,)) + cls_score_resize
+        #logit_samples    = logit_samples.permute(1,2,0)
+        #Step 2: Pass logit samples through cross entropy loss
+        #targets_resize  = targets.repeat(num_sample,1)
+        
+        #ce_loss_samples = F.cross_entropy(logit_samples, targets_resize,reduction='none')
+        #Step 3: Undo NLL
+        softmax_samples  = F.softmax(logit_samples,dim=2)
+        #softmax_samples = torch.exp(-ce_loss_samples)
+        #Step 4: Take average of T samples
+        avg_softmax     = torch.mean(softmax_samples,dim=0)
+        #Step 5: Redo NLL
+        ce_loss         = F.nll_loss(torch.log(avg_softmax),targets)
+        #Step 6: Add regularizer
+        ce_loss         += 0.01*torch.mean(cls_var)
+        #ce_loss         = -torch.log(avg_softmax)
+        a_mutual_info   = self._categorical_mutual_information(logit_samples)
+        #targets_resize = targets.repeat(num_sample,1)
+        #distorted_ce = -F.cross_entropy(logits, targets_resize,reduction='none')
+        #ce_noise     = torch.log(distorted_ce) - undistorted_ce.repeat(num_sample,1)
+        #ce_noise_var = torch.var(ce_noise)
+        #ce_noise_var = torch.pow(-torch.log(torch.mean(torch.exp(ce_noise),dim=0)),2)
+        #ce_elu       = -1*torch.nn.functional.elu(-ce_noise)
+        #ce_var_loss  = ce_elu + undistorted_ce.repeat(num_sample,1)
+        #ce_var_loss  = torch.log(torch.mean(torch.exp(ce_var_loss),dim=0)+1e-9)
+        #regularizer   = torch.mean(ce_noise_mean)
+        #regularizer   = regularizer - 1
+        #regularizer   = torch.mean(torch.pow(ce_noise,2))
+        #distorted_ce = -torch.nn.functional.elu(-distorted_ce)
+        #ce_loss = -torch.log(torch.mean(torch.exp(-distorted_ce),dim=0))
+        #ce_loss = torch.mean(ce_loss)
+        #print('ce loss {}'.format(ce_loss))
+        #print('ce_var_loss {}'.format())
+        #print('reg {}'.format(regularizer))
+        #print('cls_var {}'.format(torch.mean(cls_var)))
+        return ce_loss, a_mutual_info
 
     def _region_proposal(self, net_conv):
         #this links net conv -> rpn_net -> relu
@@ -304,10 +452,12 @@ class Network(nn.Module):
             0, 2, 3, 1).contiguous()  # batch * h * w * (num_anchors*4)
 
         if self._mode == 'TRAIN':
+            #At this point, rpn_bbox_pred is a normalized delta
             rois, roi_scores = self._proposal_layer(
                 rpn_cls_prob, rpn_bbox_pred)  # rois, roi_scores are varible
             #target labels and roi's to supply later half of network with golden results
             rpn_labels = self._anchor_target_layer(rpn_cls_score)
+            #ROI's passed into proposal_target_layer have been pre-transformed and are true bounding boxes
             rois, _ = self._proposal_target_layer(rois, roi_scores)
             self._predictions['rpn_labels'] = rpn_labels
         else:
@@ -327,19 +477,40 @@ class Network(nn.Module):
 
         return rois
 
-    def _region_classification(self, fc7_dropout, fc7):
-        fc8       = self.fc8(fc7_dropout)
-        cls_score = self.cls_score_net(fc7)
-        cls_pred = torch.max(cls_score, 1)[1]
-        cls_prob = F.softmax(cls_score, dim=1)
-        bbox_pred = self.bbox_pred_net(fc7)
+    #Used to dynamically change batch size depending on eval or train
+    def set_num_mc_run(self,num_mc_run):
+        self._num_mc_run = num_mc_run
 
-        self._predictions['cls_score'] = cls_score
+    def _region_classification(self, fc7):
+        #fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
+        if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
+            cls_score_in = self._cls_tail(fc7,True)
+        else:
+            cls_score_in = fc7
+        cls_score = self.cls_score_net(cls_score_in)
+        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
+            bbox_pred_in = self._bbox_tail(fc7,True)
+        else:
+            bbox_pred_in = fc7
+        bbox_pred = self.bbox_pred_net(bbox_pred_in)
+
+        cls_score_mean = torch.mean(cls_score,dim=0)
+        cls_pred = torch.max(cls_score_mean, 1)[1]
+        cls_prob = torch.mean(F.softmax(cls_score, dim=2),dim=0)
+        self._mc_run_output['bbox_pred'] = bbox_pred
+        self._mc_run_output['cls_score'] = cls_score
+        self._predictions['cls_score'] = cls_score_mean
         self._predictions['cls_pred'] = cls_pred
         self._predictions['cls_prob'] = cls_prob
-        self._predictions['bbox_pred'] = bbox_pred
-
-        return cls_prob, bbox_pred
+        #TODO: Make domain shift here
+        self._predictions['bbox_pred'] = torch.mean(bbox_pred,dim=0)
+        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            bbox_var  = self.bbox_al_var_net(fc7)
+            self._predictions['a_bbox_var']  = torch.mean(bbox_var,dim=0)
+        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+            a_cls_var   = self.cls_al_var_net(cls_score_in)
+            a_cls_var = torch.exp(torch.mean(a_cls_var,dim=0))
+            self._predictions['a_cls_var']   = a_cls_var
 
     def _image_to_head(self):
         raise NotImplementedError
@@ -374,15 +545,36 @@ class Network(nn.Module):
         # rpn
         self.rpn_net = nn.Conv2d(
             self._net_conv_channels, cfg.RPN_CHANNELS, [3, 3], padding=1)
-        self.fc8               = nn.Linear(self._fc7_channels,self._fc7_channels)
         self.rpn_cls_score_net = nn.Conv2d(cfg.RPN_CHANNELS, self._num_anchors * 2, [1, 1])
 
         self.rpn_bbox_pred_net = nn.Conv2d(cfg.RPN_CHANNELS,
                                            self._num_anchors * 4, [1, 1])
-
-        self.cls_score_net = nn.Linear(self._fc7_channels, self._num_classes)
-        self.bbox_pred_net = nn.Linear(self._fc7_channels, self._num_classes * 4)
-
+        if(cfg.ENABLE_CUSTOM_TAIL):
+            self.t_fc1           = nn.Linear(self._roi_pooling_channels,self._fc7_channels*8)
+            self.t_fc2           = nn.Linear(self._fc7_channels*8,self._fc7_channels*4)
+            self.t_fc3           = nn.Linear(self._fc7_channels*4,self._fc7_channels*2)
+        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
+            self.bbox_fc1        = nn.Linear(self._fc7_channels, self._fc7_channels)
+            self.bbox_fc2        = nn.Linear(self._fc7_channels, int(self._fc7_channels/2))
+            self.bbox_fc3        = nn.Linear(int(self._fc7_channels/2), int(self._fc7_channels/4))
+            self.bbox_pred_net       = nn.Linear(int(self._fc7_channels/2), self._num_classes * 4)
+            #self.bbox_dropout         = nn.Dropout(0.4)
+            #self.bbox_post_dropout_fc = nn.Linear(self._fc7_channels*2, self._fc7_channels)
+        else:
+            self.bbox_pred_net       = nn.Linear(self._fc7_channels, self._num_classes * 4)
+        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            self.bbox_al_var_net  = nn.Linear(int(self._fc7_channels), self._num_classes * 4)
+        if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
+            self.cls_fc1        = nn.Linear(self._fc7_channels, self._fc7_channels)
+            self.cls_fc2        = nn.Linear(self._fc7_channels, int(self._fc7_channels/2))
+            self.cls_fc3        = nn.Linear(int(self._fc7_channels/2), int(self._fc7_channels/4))
+            self.cls_score_net       = nn.Linear(int(self._fc7_channels/4), self._num_classes)
+            #self.cls_dropout         = nn.Dropout(0.4)
+            #self.cls_post_dropout_fc = nn.Linear(self._fc7_channels*2, self._fc7_channels)
+        else:
+            self.cls_score_net       = nn.Linear(self._fc7_channels, self._num_classes)
+        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+            self.cls_al_var_net   = nn.Linear(int(self._fc7_channels/4),self._num_classes)
         self.init_weights()
 
     def _run_summary_op(self, val=False, summary_size=1):
@@ -455,21 +647,92 @@ class Network(nn.Module):
             pool5 = self._roi_align_layer(net_conv, rois)
         else:
             pool5 = self._roi_pool_layer(net_conv, rois)
-        del net_conv
+        #del net_conv
         if self._mode == 'TRAIN':
             #Find best algo
+            #self._num_mc_run = 1
             torch.backends.cudnn.benchmark = True  # benchmark because now the input size are fixed
-        #pool_dropout = nn.Dropout(0.4)
-        #pool5_d = pool_dropout(pool5)
-        fc7 = self._head_to_tail(pool5)
-        head_dropout_layer = nn.Dropout(0.4)
-        fc7_d = head_dropout_layer(fc7)
-        cls_prob, bbox_pred = self._region_classification(fc7_d,fc7)
+        #elif(self._mode == 'TEST'):
+        #    self._num_mc_run = 10
+        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR or cfg.ENABLE_EPISTEMIC_CLS_VAR):
+            dropout_en = True
+        else:
+            dropout_en = False
+        if(cfg.ENABLE_CUSTOM_TAIL):
+            fc7 = self._custom_tail(pool5,dropout_en)
+        else:
+            fc7 = self._head_to_tail(pool5,dropout_en)
+            fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
 
+        self._region_classification(fc7)
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
 
-        return cls_prob, bbox_pred
+    def _cls_tail(self,fc7,dropout_en):
+        if(dropout_en):
+            fc_dropout_rate   = 0.5
+        else:
+            fc_dropout_rate   = 0.0
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+        fc1     = self.cls_fc1(fc7)
+        fc1_r   = fc_relu(fc1)
+        fc1_d   = fc_dropout1(fc1_r)
+        fc2     = self.cls_fc2(fc1_d)
+        fc2_r   = fc_relu(fc2)
+        fc2_d   = fc_dropout2(fc2_r)
+        fc3     = self.cls_fc3(fc2_d)
+        fc3_r   = fc_relu(fc3)
+        fc3_d   = fc_dropout2(fc3_r)
+        return fc3_d
+
+    def _bbox_tail(self,fc7,dropout_en):
+        if(dropout_en):
+            fc_dropout_rate   = 0.4
+        else:
+            fc_dropout_rate   = 0.0
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+        fc1     = self.bbox_fc1(fc7)
+        fc1_r   = fc_relu(fc1)
+        fc1_d   = fc_dropout1(fc1_r)
+        fc2     = self.bbox_fc2(fc1_d)
+        fc2_r   = fc_relu(fc2)
+        fc2_d   = fc_dropout2(fc2_r)
+        fc3     = self.bbox_fc3(fc2_d)
+        fc3_r   = fc_relu(fc3)
+        fc3_d   = fc_dropout2(fc3_r)
+        return fc2_d
+
+    def _custom_tail(self,pool5,dropout_en):
+        pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._num_mc_run,1,1)
+        if(dropout_en):
+            conv_dropout_rate = 0.2
+            fc_dropout_rate   = 0.5
+        else:
+            conv_dropout_rate = 0.0
+            fc_dropout_rate   = 0.0
+        pool_dropout = nn.Dropout(conv_dropout_rate)
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_dropout4   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+        pool5_d = pool_dropout(pool5)
+        fc1     = self.t_fc1(pool5_d)
+        fc1_r   = fc_relu(fc1)
+        fc1_d   = fc_dropout1(fc1_r)
+        fc2     = self.t_fc2(fc1_d)
+        fc2_r   = fc_relu(fc2)
+        fc2_d   = fc_dropout2(fc2_r)
+        fc3     = self.t_fc3(fc2_d)
+        fc3_r   = fc_relu(fc3)
+        fc3_d   = fc_dropout3(fc3_r)
+        return fc3_d
 
     def forward(self, image, im_info=None, gt_boxes=None, gt_boxes_dc=None, mode='TRAIN'):
         self._image_gt_summaries['image'] = image
@@ -484,53 +747,112 @@ class Network(nn.Module):
         self._gt_boxes_dc = torch.from_numpy(gt_boxes_dc).to(
             self._device) if gt_boxes is not None else None
         self._mode = mode
+        #This overrides the mode so configuration parameters used in train can also be used for val
         if(mode == 'VAL'):
             self._mode = 'TRAIN'
 
-        cls_prob, bbox_pred = self._predict()
-        total_loss = 0
-        if mode == 'TEST':
-            #These are the deltas and they come out of the NN normalized, need to undo this
-            stds = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(
-                self._num_classes).unsqueeze(0).expand_as(bbox_pred)
-            means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
-                self._num_classes).unsqueeze(0).expand_as(bbox_pred)
-            #Batch Norm?
-            self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
-        elif(mode == 'VAL'):
-            self._add_losses()
-            #????
+        self._predict()
+
+
+        #ENABLE to draw all anchors
+        self._draw_and_save_anchors(image,
+                                    im_info,
+                                    self._anchor_targets['anchors'])
+
+        #ENABLE to draw all anchor targets
+        self._draw_and_save_targets(image,
+                                    im_info,
+                                    self._anchor_targets['rpn_bbox_targets'],
+                                    self._anchor_targets['anchors'],
+                                    self._anchor_targets['rpn_labels'],
+                                    self._anchor_targets['rpn_bbox_inside_weights'],
+                                    'anchor')
+
+        #ENABLE to draw all proposal targets
+        self._draw_and_save_targets(image,
+                                    im_info,
+                                    self._proposal_targets['bbox_targets'],
+                                    self._proposal_targets['rois'],
+                                    self._proposal_targets['labels'],
+                                    self._proposal_targets['bbox_inside_weights'],
+                                    'proposal')
+        if(mode == 'VAL' or mode == 'TRAIN'):
+            self._add_losses()  # compute losses
+        if(mode == 'VAL' or mode == 'TEST'):
+            bbox_pred = self._predictions['bbox_pred']
+            #bbox_targets are pre-normalized for loss, so modifying here.
             #Expand as -> broadcast 
             stds = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS).repeat(
                 self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             means = bbox_pred.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS).repeat(
-               self._num_classes).unsqueeze(0).expand_as(bbox_pred)
+                self._num_classes).unsqueeze(0).expand_as(bbox_pred)
             #Batch Norm?
-            self._predictions['bbox_pred'] = bbox_pred.mul(stds).add(means)
-        else:
-            total_loss = self._add_losses()  # compute losses
-        #if(total_loss > 1):
-        #    self._draw_and_save(image,gt_boxes)
+            bbox_mean = bbox_pred.mul(stds).add(means)
+            #bbox_var = self._predictions['a_bbox_var']
+            if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+                bbox_gaussian = torch.distributions.Normal(0,torch.sqrt(torch.exp(self._predictions['a_bbox_var'])))
+                bbox_samples = bbox_gaussian.sample((self._num_aleatoric_samples,)) + bbox_mean
+                mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,im_info[2])
+                #TODO: Maybe detach here?
+                roi_coords = self._predictions['rois'][:,1:].unsqueeze(0).repeat(self._num_aleatoric_samples,1,1)
+                roi_coords = roi_coords.view(-1,roi_coords.shape[2])
+                bbox_samples = bbox_samples.view(-1,bbox_samples.shape[2])
+                bbox_inv_samples = bbox_transform_inv(roi_coords,bbox_samples,im_info[2])
+                bbox_inv_samples = bbox_inv_samples.view(self._num_aleatoric_samples,-1,bbox_inv_samples.shape[1])
+                bbox_inv_var = self._compute_bbox_var(bbox_inv_samples)
+                self._predictions['bbox_inv_pred']  = mean_bbox_inv
+                self._predictions['a_bbox_inv_var'] = bbox_inv_var
+            else:
+                mean_bbox_inv = bbox_transform_inv(self._predictions['rois'][:,1:],bbox_mean,im_info[2])
+                self._predictions['bbox_inv_pred'] = mean_bbox_inv
+        #Reset to mode == VAL
+        self._mode = mode
 
     def init_weights(self):
-        def normal_init(m, mean, stddev, truncated=False):
+        def uniform_init(m, min_v, max_v,bias=0.0):
+            """
+      weight initalizer: truncated normal and random normal.
+      """
+            m.weight.data.uniform_(min_v, max_v)
+            #m.bias.data.zero_()
+            m.bias.data.fill_(bias)
+
+        def normal_init(m, mean, stddev, truncated=False,bias=0.0):
             """
       weight initalizer: truncated normal and random normal.
       """
             # x is a parameter
             if truncated:
+                #In-place functions to save GPU mem
                 m.weight.data.normal_().fmod_(2).mul_(stddev).add_(
                     mean)  # not a perfect approximation
             else:
                 m.weight.data.normal_(mean, stddev)
-            m.bias.data.zero_()
+            #m.bias.data.zero_()
+            m.bias.data.fill_(bias)
         
         normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
+        if(cfg.ENABLE_CUSTOM_TAIL):
+            normal_init(self.t_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.t_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.t_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
+
         normal_init(self.rpn_cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
         normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
-
+        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
+            normal_init(self.bbox_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.bbox_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.bbox_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
+        if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
+            normal_init(self.cls_fc1, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.cls_fc2, 0, 0.01, cfg.TRAIN.TRUNCATED)
+            normal_init(self.cls_fc3, 0, 0.01, cfg.TRAIN.TRUNCATED)
+        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            normal_init(self.bbox_al_var_net, 0, 0.05, cfg.TRAIN.TRUNCATED)
+        if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+            normal_init(self.cls_al_var_net, 0, 0.04,cfg.TRAIN.TRUNCATED)
     # Extract the head feature maps, for example for vgg16 it is conv5_3
     # only useful during testing mode
     def extract_head(self, image):
@@ -543,11 +865,14 @@ class Network(nn.Module):
         self.eval()
         with torch.no_grad():
             self.forward(image, im_info, None, None, mode='TEST')
-        cls_score, cls_prob, bbox_pred, rois = self._predictions["cls_score"].data.cpu().numpy(), \
-                                                         self._predictions['cls_prob'].data.cpu().numpy(), \
-                                                         self._predictions['bbox_pred'].data.cpu().numpy(), \
-                                                         self._predictions['rois'].data.cpu().numpy()
-        return cls_score, cls_prob, bbox_pred, rois
+        cls_score, cls_prob, bbox_pred, rois = self._predictions["cls_score"].data.cpu().detach(), \
+                                                         self._predictions['cls_prob'].data.detach(), \
+                                                         self._predictions['bbox_inv_pred'].data.detach(), \
+                                                         self._predictions['rois'].data.detach()
+
+        a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,im_info[2])
+
+        return cls_score, cls_prob, a_cls_entropy, a_cls_var, e_cls_mutual_info, bbox_pred, a_bbox_var, e_bbox_var, rois
 
     def delete_intermediate_states(self):
         # Delete intermediate result to save memory
@@ -565,51 +890,100 @@ class Network(nn.Module):
         with torch.no_grad():
             self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
         self.train()
-        summary = None
-        bbox_predictions = self._predictions['bbox_pred'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
-        cls_prob         = self._predictions['cls_prob'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes)
-        rois             = self._predictions['rois'].data.detach().cpu().numpy()
-        roi_labels       = self._proposal_targets['labels'].data.detach().cpu().numpy()
-        #For tensorboard
+        summary           = None
+        bbox_pred         = self._predictions['bbox_inv_pred'].data.detach() #(self._fc7_channels, self._num_classes * 4)
+        cls_prob         = self._predictions['cls_prob'].data.detach() #(self._fc7_channels, self._num_classes)
+        rois             = self._predictions['rois'].data.detach()
+        roi_labels       = self._proposal_targets['labels'].data.detach()
+
+        a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,blobs['im_info'][2])
         for k in self._losses.keys():
             if(k in self._val_event_summaries):
-                self._val_event_summaries[k] += self._losses[k]
+                self._val_event_summaries[k] += self._losses[k].item()
             else:
-                self._val_event_summaries[k] = self._losses[k]
+                self._val_event_summaries[k] = self._losses[k].item()
         if(update_summaries is True):
             summary = self._run_summary_op(True,sum_size)
         self.delete_intermediate_states()
-        return summary, rois, roi_labels, bbox_predictions, cls_prob
+        return summary, rois, roi_labels, bbox_pred, a_bbox_var, e_bbox_var, cls_prob, a_cls_entropy, a_cls_var, e_cls_mutual_info
+
+    def _uncertainty_postprocess(self,bbox_pred,cls_prob,rois,im_scale):
+        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            a_bbox_var = self._predictions['a_bbox_inv_var'].data.detach() #(self._fc7_channels, self._num_classes * 4)
+        else:
+            a_bbox_var = None
+        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            cls_prob = self._predictions['cls_prob'] #(self._fc7_channels, self._num_classes * 4)
+            #TODO: This should not be taking the mean yet, we need to filter by top indices
+            #a_cls_entropy = -torch.mean(a_cls_entropy)*torch.log(torch.mean(a_cls_entropy)) - (1-torch.mean(a_cls_entropy))*torch.log(1-torch.mean(a_cls_entropy))
+            a_cls_entropy = self._categorical_entropy(cls_prob)
+            a_cls_entropy = a_cls_entropy.data.detach()
+            a_cls_var = self._predictions['a_cls_var']
+            #Compute class entropy
+        else:
+            a_cls_entropy = None
+            a_cls_var     = None
+        #if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+        #    cls_var = self._predictions['cls_var'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
+        #else:
+        #    cls_var = None
+        #For tensorboard
+        if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
+            e_cls_score = self._mc_run_output['cls_score'].detach()
+            #Compute average entropy via mutual information
+            e_cls_mutual_info = self._categorical_mutual_information(e_cls_score)
+            self._mc_run_results['e_cls_mutual_info'] = torch.mean(e_cls_mutual_info)
+            self._mc_run_output['e_cls_mutual_info'] = e_cls_mutual_info
+        else:
+            e_cls_mutual_info = torch.tensor([0])
+
+        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
+            #All of this to simply get the predictions from [M,N,C] to [M*N,C] interleaved.
+            #This is to not change bbox_transform_inv
+            mc_bbox_pred = self._mc_run_output['bbox_pred']
+            mc_bbox_pred = mc_bbox_pred.view(-1,mc_bbox_pred.shape[2])
+            roi_sampled = rois[:,1:]
+            roi_sampled = roi_sampled.unsqueeze(0).repeat(self._num_mc_run,1,1)
+            roi_sampled = roi_sampled.view(-1,roi_sampled.shape[2])
+            mc_bbox_pred = bbox_transform_inv(roi_sampled,mc_bbox_pred,im_scale)
+            mc_bbox_pred = mc_bbox_pred.view(self._num_mc_run,-1,mc_bbox_pred.shape[1])
+            #Way #1 to compute bbox var
+            #mc_bbox_covar = self._compute_bbox_cov(mc_bbox_pred)
+            #Way #2 to compute bbox var
+            e_bbox_var   = self._compute_bbox_var(mc_bbox_pred)
+            #Way #3 to compute bbox var
+            #Doesnt work??
+            #e_bbox_var = torch.var(mc_bbox_pred,dim=0)
+            self._mc_run_output['e_bbox_var'] = e_bbox_var
+            self._mc_run_results['e_bbox_var'] = torch.mean(e_bbox_var)
+            #Compute average variance
+        else:
+            e_bbox_var = torch.tensor([0])
+        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR or cfg.ENABLE_EPISTEMIC_CLS_VAR):
+            for k in self._mc_run_results.keys():
+                if(k in self._val_event_summaries):
+                    self._val_event_summaries[k] += self._mc_run_results[k].item()
+                else:
+                    self._val_event_summaries[k] = self._mc_run_results[k].item()
+        return a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info
 
     def train_step(self, blobs, train_op, update_weights=False):
         #Computes losses for single image
         self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
         #.item() converts single element of type pytorch.tensor to a primitive float/int
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self._losses["rpn_cross_entropy"].item(), \
-                                                                            self._losses['rpn_loss_box'].item(), \
-                                                                            self._losses['cross_entropy'].item(), \
-                                                                            self._losses['loss_box'].item(), \
-                                                                            self._losses['total_loss'].item()
-        #utils.timer.timer.tic('backward')
         self._losses['total_loss'].backward()
+        loss = self._losses['total_loss'].item()
+        #utils.timer.timer.tic('backward')
         #utils.timer.timer.toc('backward')
-        self._cum_losses['total_loss']        += loss
-        self._cum_losses['rpn_cross_entropy'] += rpn_loss_cls
-        self._cum_losses['rpn_loss_box']      += rpn_loss_box
-        self._cum_losses['cross_entropy']     += loss_cls
-        self._cum_losses['loss_box']          += loss_box
+        for key in self._cum_loss_keys:
+            if(key in self._cum_losses):
+                self._cum_losses[key] += self._losses[key].item()
+            else:
+                self._cum_losses[key] = self._losses[key].item()
         self._batch_gt_entries                += len(blobs['gt_boxes'])
         if(update_weights):
-            #print('updating weights to end batch')
-            #print(self._cum_losses['total_loss'])
-
-            #normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            #normal_init(self.rpn_cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            #normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            #normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-            #normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
             #Clip gradients
-            torch.nn.utils.clip_grad_norm_([x[1] for x in self.named_parameters()],25)
+            torch.nn.utils.clip_grad_norm_([x[1] for x in self.named_parameters()],20)
             train_op.step()
             train_op.zero_grad()
             for k in self._cum_losses.keys():
@@ -617,25 +991,21 @@ class Network(nn.Module):
                     self._event_summaries[k] += self._cum_losses[k]
                 else:
                     self._event_summaries[k] = self._cum_losses[k]
-            self._cum_gt_entries                  += self._batch_gt_entries
-            self._cum_losses['total_loss']        = 0
-            self._cum_losses['rpn_cross_entropy'] = 0
-            self._cum_losses['rpn_loss_box']      = 0
-            self._cum_losses['cross_entropy']     = 0
-            self._cum_losses['loss_box']          = 0
+            self._cum_losses        = {}
             self._batch_gt_entries                = 0
+            self._cum_gt_entries                  += self._batch_gt_entries
         #Should actually be divided by batch size, but whatever
         self._cum_im_entries                     += 1
         self.delete_intermediate_states()
 
-        return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss
+        return loss
 
     def train_step_with_summary(self, blobs, train_op, sum_size, update_weights=False):
-        rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss = self.train_step(blobs, train_op, update_weights)
+        loss = self.train_step(blobs, train_op, update_weights)
         summary = self._run_summary_op(False, self._cum_im_entries)
         self._cum_gt_entries = 0
         self._cum_im_entries = 0
-        return rpn_loss_cls, rpn_loss_box, loss_cls, loss_box, loss, summary
+        return loss, summary
 
     def train_step_no_return(self, blobs, train_op):
         self.forward(blobs['data'], blobs['im_info'], blobs['gt_boxes'], blobs['gt_boxes_dc'])
@@ -663,3 +1033,77 @@ class Network(nn.Module):
             self, {k: v
                    for k, v in state_dict.items() if k in self.state_dict()}
             )
+
+
+    def _draw_and_save_targets(self,frame,info,targets,rois,labels,mask,target_type):
+        datapath = os.path.join(cfg.DATA_DIR,'debug')
+        out_file = os.path.join(datapath,'{}_{}_target_{}.png'.format(self._cnt, target_type,'image'))
+        frame = frame[0]*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
+        frame = frame.astype(dtype=np.uint8)
+        img = Image.fromarray(frame,'RGB')
+        draw = ImageDraw.Draw(img)
+        if(target_type == 'anchor'):
+            mask   = mask.view(-1,4)
+            labels = labels.permute(0,2,3,1).reshape(-1)
+        #if(target_type == 'anchor'):
+        if(target_type == 'proposal'):
+            #Target is in a (N,K*7) format, transform to (N,7) where corresponding label dictates what class bbox belongs to 
+            sel_targets = torch.where(labels == 0, targets[:,0:4],targets[:,4:8])
+            #Get subset of mask for specific class selected
+            mask = torch.where(labels == 0, mask[:,0:4], mask[:,4:8])
+            sel_targets = sel_targets*mask
+            rois = rois[:,1:5]
+            #Extract XC,YC and L,W
+            targets = sel_targets
+            stds = targets.data.new(cfg.TRAIN.BBOX_NORMALIZE_STDS[0:4]).unsqueeze(0).expand_as(targets)
+            means = targets.data.new(cfg.TRAIN.BBOX_NORMALIZE_MEANS[0:4]).unsqueeze(0).expand_as(targets)
+            targets = targets.mul(stds).add(means)
+        rois = rois.view(-1,4)
+        targets = targets.view(-1,4)
+        anchors = bbox_transform_inv(rois,targets)
+        label_mask = labels + 1
+        label_idx  = label_mask.nonzero().squeeze(1)
+        anchors_filtered = anchors[label_idx,:]
+        #else:
+        #    anchors = bbox_3d_transform_inv_all_boxes(anchors_3d,targets)
+            #anchors = 3d_to_bev(anchors)
+        for i, bbox in enumerate(anchors.view(-1,4)):
+            bbox_mask = mask[i]
+            bbox_label = int(labels[i])
+            roi        = rois[i]
+            np_bbox = None
+            #if(torch.mean(bbox_mask) > 0):
+            if(bbox_label == 1):
+                np_bbox = bbox.data.cpu().numpy()
+                draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
+                draw.rectangle(np_bbox,width=1,outline='green')
+                if(np_bbox[0] >= np_bbox[2]):
+                    print('x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
+                if(np_bbox[1] >= np_bbox[3]):
+                    print('y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
+            elif(bbox_label == 0):
+                np_bbox = roi.data.cpu().numpy()
+                draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
+                draw.rectangle(np_bbox,width=1,outline='red')
+                if(np_bbox[0] >= np_bbox[2]):
+                    print('x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
+                if(np_bbox[1] >= np_bbox[3]):
+                    print('y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
+        img.save(out_file,'png')
+        print('Saving target file at location {}'.format(out_file))  
+        self._cnt += 1 
+
+    def _draw_and_save_anchors(self,frame,info,anchors):
+        datapath = os.path.join(cfg.DATA_DIR,'debug')
+        out_file = os.path.join(datapath,'{}_{}.png'.format(self._cnt,'image'))
+        frame = frame[0]*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
+        frame = frame.astype(dtype=np.uint8)
+        frame = Image.fromarray(frame,'RGB')
+        draw = ImageDraw.Draw(frame)
+        for i, bbox in enumerate(anchors.data.cpu().numpy()):
+            mod = i%900
+            if(mod < 9):
+                draw.rectangle(bbox,width=1,outline=(int(mod/9.0*255),0,0))
+        frame.save(out_file,'png')
+        print('Saving file at location {}'.format(out_file))  
+        self._cnt += 1 
