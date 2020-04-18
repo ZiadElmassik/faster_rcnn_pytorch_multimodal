@@ -58,6 +58,7 @@ class Network(nn.Module):
         self._gt_summaries        = {}
         self._cnt              = 0
         self._anchor_cnt       = 0
+        self._frame_scale      = 1.0
         self._proposal_cnt     = 0
         self._device           = 'cuda'
         self._cum_loss_keys    = ['total_loss','rpn_cross_entropy','rpn_loss_box']
@@ -87,7 +88,7 @@ class Network(nn.Module):
         # add back mean
         image = ((self._gt_summaries['frame']))*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
         #Flip info from (xmin,xmax,ymin,ymax) to (ymin,ymax,xmin,xmax) due to frame being rotated
-        frame_range = np.asarray([self._info[3] - self._info[2] + 1, self._info[1] - self._info[0] + 1])
+        frame_range = np.asarray([self._info[3] - self._info[2], self._info[1] - self._info[0]])
         resized = frame_range / self._info[6]
         resized = resized.astype(dtype=np.int64)
         image = imresize(image[0], resized)
@@ -190,12 +191,12 @@ class Network(nn.Module):
         if(self._net_type == 'image'):
             anchors, anchor_length = generate_anchors_pre(\
                                                 height, width,
-                                                self._feat_stride, self._anchor_scales, self._anchor_ratios)
+                                                self._feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
             #TODO: Unused, shouldn't use unless lidar. fix please.
             self._anchors_3d = torch.from_numpy(anchors).to(self._device)
         elif(self._net_type == 'lidar'):
             anchor_generator = GridAnchor3dGenerator()
-            anchor_length, anchors = anchor_generator._generate(height, width, self._feat_stride, self._anchor_scales, self._anchor_ratios)
+            anchor_length, anchors = anchor_generator._generate(height, width, self._feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
             self._anchors_3d = torch.from_numpy(anchors).to(self._device)
             anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*self._feat_stride-1, (height)*self._feat_stride-1)
         self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
@@ -671,7 +672,7 @@ class Network(nn.Module):
         self._gt_summaries['gt_boxes_dc'] = gt_boxes_dc
         self._gt_summaries['info'] = info
         self._info = info  # No need to change; actually it can be an list
-        scale = info[6]
+        self._frame_scale = info[6]
         self._frame = torch.from_numpy(frame.transpose([0, 3, 1,
                                                         2])).to(self._device)
         if(mode == 'TRAIN' or mode == 'VAL'):
@@ -755,21 +756,21 @@ class Network(nn.Module):
                 if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
                     bbox_gaussian = torch.distributions.Normal(0,torch.sqrt(torch.exp(self._predictions['a_bbox_var'])))
                     bbox_samples = bbox_gaussian.sample((self._num_aleatoric_samples,)) + bbox_mean
-                    mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,scale)
+                    mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,self._frame_scale)
                     #TODO: Maybe detach here?
                     roi_coords = rois.unsqueeze(0).repeat(self._num_aleatoric_samples,1,1)
                     roi_coords = roi_coords.view(-1,roi_coords.shape[2])
                     bbox_samples = bbox_samples.view(-1,bbox_samples.shape[2])
-                    bbox_inv_samples = bbox_transform_inv(roi_coords,bbox_samples,scale)
+                    bbox_inv_samples = bbox_transform_inv(roi_coords,bbox_samples,self._frame_scale)
                     bbox_inv_samples = bbox_inv_samples.view(self._num_aleatoric_samples,-1,bbox_inv_samples.shape[1])
                     bbox_inv_var = self._compute_bbox_var(bbox_inv_samples)
                     self._predictions['bbox_inv_pred']  = mean_bbox_inv
                     self._predictions['a_bbox_inv_var'] = bbox_inv_var
                 else:
                     if(self._net_type == 'image'):
-                        mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,scale)
+                        mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,self._frame_scale)
                     elif(self._net_type == 'lidar'):
-                        mean_bbox_inv = lidar_3d_bbox_transform_inv(self._predictions['anchors_3d'],bbox_mean,scale)
+                        mean_bbox_inv = lidar_3d_bbox_transform_inv(self._predictions['rois'][:,1:5],self._predictions['anchors_3d'],bbox_mean,self._frame_scale)
                     
                     self._predictions['bbox_inv_pred'] = mean_bbox_inv
 
@@ -813,17 +814,18 @@ class Network(nn.Module):
         with torch.no_grad():
             self.forward(blobs['data'], blobs['info'], blobs['gt_boxes'], blobs['gt_boxes_dc'], mode='VAL')
         self.train()
+        scale = blobs['info'][6]
         if(cfg.ENABLE_FULL_NET):
             summary           = None
             bbox_pred         = self._predictions['bbox_inv_pred'].data.detach() #(self._fc7_channels, self._num_classes * 4)
             cls_prob          = self._predictions['cls_prob'].data.detach() #(self._fc7_channels, self._num_classes)
-            rois              = self._predictions['rois'].data.detach()
+            rois              = self._predictions['rois'].data.detach()/scale
             roi_labels        = self._proposal_targets['labels'].data.detach()
 
-            uncertainties = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,blobs['info'][4])
+            uncertainties = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,blobs['info'][6])
         else:
             summary    = None
-            bbox_pred  = self._predictions['rois'][:,1:5]
+            bbox_pred  = self._predictions['rois'][:,1:5]/scale
             cls_prob   = self._predictions['roi_scores']
             rois       = self._gt_boxes[:, :4]
             roi_labels = self._gt_boxes[:,4:5]
@@ -1044,7 +1046,7 @@ class Network(nn.Module):
             means = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
             targets = targets.mul(stds).add(means)
             targets = targets.view(-1,7)
-            anchors = lidar_3d_bbox_transform_inv(anchors_3d,targets)
+            anchors = lidar_3d_bbox_transform_inv(rois,anchors_3d,targets)
             anchors = anchors.data.cpu().numpy()
             anchors = bbox_utils.bbaa_graphics_gems(anchors,voxel_grid_rgb.shape[1],voxel_grid_rgb.shape[0])
             #rois = anchors
@@ -1158,15 +1160,15 @@ class Network(nn.Module):
             img = None
         draw = ImageDraw.Draw(img)
         for i, bbox in enumerate(anchors.data.cpu().numpy()):
-            if(i%900 < 3):
+            if(i%900 < 9):
                 c = (255,255,255)
-                if(i%900 == 0):
+                if(i%3 == 0):
                     c = (255,0,0)
-                if(i%900 == 1):
+                if(i%3 == 1):
                     c = (0,255,0)
-                if(i%900 == 2):
+                if(i%3 == 2):
                     c = (0,0,255)
-                draw.rectangle(bbox,width=1,outline=(255,0,0))
+                draw.rectangle(bbox,width=1,outline=c)
         img.save(out_file,'png')
         print('Saving file at location {}'.format(out_file))  
         self._cnt += 1 
