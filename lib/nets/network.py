@@ -1098,8 +1098,8 @@ class Network(nn.Module):
             rois = rois[:,1:5]
             #Extract XC,YC and L,W
             targets = sel_targets
-            stds = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_STDS[0:4]).unsqueeze(0).expand_as(targets)
-            means = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_MEANS[0:4]).unsqueeze(0).expand_as(targets)
+            stds = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_STDS).unsqueeze(0).expand_as(targets)
+            means = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
             targets = targets.mul(stds).add(means)
         rois = rois.view(-1,4)
         targets = targets.view(-1,4)
