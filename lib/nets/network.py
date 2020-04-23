@@ -28,7 +28,7 @@ from layer_utils.proposal_top_layer import proposal_top_layer
 from layer_utils.anchor_target_layer import anchor_target_layer, anchor_target_layer_torch
 from layer_utils.proposal_target_layer import proposal_target_layer
 from utils.visualization import draw_bounding_boxes
-from model.bbox_transform import bbox_transform_inv, lidar_3d_bbox_transform_inv, clip_boxes
+from model.bbox_transform import bbox_transform_inv, lidar_3d_bbox_transform_inv, clip_boxes, lidar_3d_uncertainty_transform_inv, uncertainty_transform_inv
 
 from torchvision.ops import RoIAlign, RoIPool
 from torchvision import transforms
@@ -66,18 +66,17 @@ class Network(nn.Module):
         if(cfg.ENABLE_FULL_NET):
             self._cum_loss_keys.append('loss_box')
             self._cum_loss_keys.append('cross_entropy')
-            if(cfg.NET_TYPE == 'lidar'):
-                self._cum_loss_keys.append('ry_loss')
-            if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+            #if(cfg.NET_TYPE == 'lidar'):
+            #    self._cum_loss_keys.append('ry_loss')
+            if(cfg.UC.EN_CLS_ALEATORIC):
                 self._cum_loss_keys.append('a_cls_var')
                 self._cum_loss_keys.append('a_cls_entropy')
-            if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            if(cfg.UC.EN_BBOX_ALEATORIC):
                 self._cum_loss_keys.append('a_bbox_var')
         self._cum_gt_entries                  = 0
         self._batch_gt_entries                = 0
         self._cum_im_entries                  = 0
-        self._num_mc_run                      = 1
-        self._num_aleatoric_samples           = cfg.NUM_ALEATORIC_SAMPLE
+        self._e_num_sample                    = 1
         self._net_type                        = cfg.NET_TYPE
         #Set on every forward pass for use with proposal target layer
         self._gt_boxes      = None
@@ -199,7 +198,8 @@ class Network(nn.Module):
             anchor_length, anchors = anchor_generator._generate(height, width, self._feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
             self._anchors_3d = torch.from_numpy(anchors).to(self._device)
             anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*self._feat_stride-1, (height)*self._feat_stride-1)
-        self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
+        if(cfg.DEBUG.DRAW_ANCHORS or cfg.DEBUG.DRAW_ANCHOR_T):
+            self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
         self._anchors = torch.from_numpy(anchors).to(self._device)
         self._anchor_length = anchor_length
 
@@ -224,7 +224,7 @@ class Network(nn.Module):
                         bbox_outside_weights,
                         sigma=1.0,
                         dim=[1]):
-        if((stage == 'RPN' and cfg.ENABLE_RPN_BBOX_VAR) or (stage == 'DET' and cfg.ENABLE_ALEATORIC_BBOX_VAR)):
+        if((stage == 'RPN' and cfg.UC.EN_RPN_BBOX_ALEATORIC) or (stage == 'DET' and cfg.UC.EN_BBOX_ALEATORIC)):
             bbox_var_en = True
         else:
             bbox_var_en = False
@@ -249,7 +249,7 @@ class Network(nn.Module):
             #Convert to sin to normalize, targets will be in degrees off of anchor
             sin_targets  = bbox_targets.reshape(-1,7)[:,6:7].reshape(-1,elem_rm)
             ry_loss      = self._huber_loss(sin_pred,sin_targets,1.0/9.0,sigma,sin_en=True)
-            self._losses['ry_loss'] = torch.mean(torch.sum(ry_loss,dim=1))
+            #self._losses['ry_loss'] = torch.mean(torch.sum(ry_loss,dim=1))
             in_loss_box  = torch.cat((loss_box.reshape(-1,6),ry_loss.reshape(-1,1)),dim=1).reshape(-1,bbox_shape[1])
             #bbox_outside_weights = torch.mean(bbox_outside_weights,axis=1)
         else:
@@ -257,7 +257,7 @@ class Network(nn.Module):
 
         if(bbox_var_en):
             #Don't need covariance matrix as it collapses itself in the end anyway
-            in_loss_box = 0.5*in_loss_box*torch.exp(-bbox_var) + 0.5*torch.exp(bbox_var)
+            in_loss_box = 0.5*in_loss_box*torch.exp(-bbox_var) + 0.5*torch.exp(bbox_var)*bbox_inside_weights
             in_loss_box = in_loss_box*bbox_inside_weights
         #Used to normalize the predictions, this is only used in the RPN
         #By default negative(background) and positive(foreground) samples have equal weighting
@@ -296,12 +296,10 @@ class Network(nn.Module):
         # RPN, bbox loss
 
         #Pretty sure these are delta's at this point
-        rpn_bbox_pred = self._predictions['rpn_bbox_pred']
-        rpn_bbox_targets = self._anchor_targets['rpn_bbox_targets']
-        rpn_bbox_inside_weights = self._anchor_targets[
-            'rpn_bbox_inside_weights']
-        rpn_bbox_outside_weights = self._anchor_targets[
-            'rpn_bbox_outside_weights']
+        rpn_bbox_pred            = self._predictions['rpn_bbox_pred']
+        rpn_bbox_targets         = self._anchor_targets['rpn_bbox_targets']
+        rpn_bbox_inside_weights  = self._anchor_targets['rpn_bbox_inside_weights']
+        rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights']
         rpn_loss_box = self._smooth_l1_loss(
             'RPN',
             rpn_bbox_pred,
@@ -324,9 +322,9 @@ class Network(nn.Module):
             bbox_outside_weights = self._proposal_targets['bbox_outside_weights']
             #Flag to only handle a_bbox_var if enabled
             #Compute aleatoric class entropy
-            if(cfg.ENABLE_ALEATORIC_CLS_VAR):
+            if(cfg.UC.EN_CLS_ALEATORIC):
                 a_cls_var  = self._predictions['a_cls_var']
-                cross_entropy, a_cls_mutual_info = self._bayesian_cross_entropy(cls_score, a_cls_var, label,cfg.NUM_CE_SAMPLE)
+                cross_entropy, a_cls_mutual_info = self._bayesian_cross_entropy(cls_score, a_cls_var, label,cfg.UC.A_NUM_CE_SAMPLE)
                 self._losses['a_cls_entropy'] = torch.mean(a_cls_mutual_info)
                 self._losses['a_cls_var']     = torch.mean(a_cls_var)
                 #Classical entropy w/out logit sampling
@@ -335,7 +333,7 @@ class Network(nn.Module):
                 cross_entropy = F.cross_entropy(cls_score, label)
                 self._losses['a_cls_entropy'] = torch.tensor(0)
             #Compute aleatoric bbox variance
-            if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
+            if(cfg.UC.EN_BBOX_ALEATORIC):
                 #Grab a local variable for a_bbox_var
                 a_bbox_var  = self._predictions['a_bbox_var']
                 #network output comes out as log(a_bbox_var), so it needs to be adjusted
@@ -343,7 +341,7 @@ class Network(nn.Module):
                 self._losses['a_bbox_var'] = (torch.exp(a_bbox_var)*bbox_inside_weights).mean()
             else:
                 a_bbox_var = None
-                self._losses['a_bbox_var'] = torch.tensor(0)
+                #self._losses['a_bbox_var'] = torch.tensor(0)
             #Compute loss box
             loss_box = self._smooth_l1_loss('DET', bbox_pred, bbox_targets, a_bbox_var, bbox_inside_weights, bbox_outside_weights)
             #Assign computed losses to be tracked in tensorboard
@@ -400,71 +398,29 @@ class Network(nn.Module):
         mutual_info += total_entropy
         return mutual_info.clamp_min(0.0)
 
-    def _bayesian_cross_entropy(self,cls_score,cls_var,targets,num_sample):
-        
-
-
-        #cls_var comes in as true variance. Network output is log(var) but exp is applied at network output.
-        #true_var       = torch.gather(cls_var,1,targets.unsqueeze(1)).squeeze(1)
-        #undistorted_ce = F.cross_entropy(cls_score, targets,reduction='none')
-
-        #Distorted loss - generate a normal distribution.
-        #Change where it is sampled from? Maybe from output of CE?
-        #preprocess
-
-        #cls_score_mask = torch.zeros((cls_score.shape[0],cls_score.shape[1]),device='cuda').scatter(1, targets, 1)
-        #for i,mask_row in enumerate(cls_score_mask):
-        #    mask_row[targets[i]] = 1
-        cls_score_mask = torch.zeros_like(cls_score).scatter_(1, targets.unsqueeze(1), 1)
-        cls_score_shifted = cls_score + cls_score_mask
-        #for i in range(cls_score.shape[0]):
-        #    for j in range(cls_score.shape[1]):
-        #        if(targets[i] == j):
-        #            cls_score_shifted[i,j] = cls_score[i,j] + 1
-        #        else:
-        #            cls_score_shifted[i,j] = cls_score[i,j]
-
-        #cls_score[:,targets] = cls_score[:,targets] + 1
-        #cls_score_shifted = torch.zeros((cls_score.shape[0],cls_score.shape[1],device='cuda').scatter_()
-        #cls_score_shifted = cls_score[:,targets] + 1
-        #Step 1: Get a set of distorted logits sampled from a gaussian distribution
+    def _logit_distort(self, cls_score, cls_var, num_sample):
         distribution     = torch.distributions.Normal(0,torch.sqrt(cls_var))
-        cls_score_resize = cls_score_shifted.repeat(num_sample,1,1)
+        cls_score_resize = cls_score.repeat(num_sample,1,1)
         logit_samples    = distribution.sample((num_sample,)) + cls_score_resize
-        #logit_samples    = logit_samples.permute(1,2,0)
-        #Step 2: Pass logit samples through cross entropy loss
-        #targets_resize  = targets.repeat(num_sample,1)
-        
-        #ce_loss_samples = F.cross_entropy(logit_samples, targets_resize,reduction='none')
-        #Step 3: Undo NLL
+        return logit_samples
+
+    def _bayesian_cross_entropy(self,cls_score,cls_var,targets,num_sample):
+        #Step 1: Create target mask to shift 'correct' logits
+        cls_score_mask = torch.zeros_like(cls_score).scatter_(1, targets.unsqueeze(1), 1)
+        cls_score_shifted = cls_score - cls_score_mask
+        #Step 2: Get a set of distorted logits sampled from a gaussian distribution
+        logit_samples    = self._logit_distort(cls_score_shifted,cls_var,num_sample)
+        #Step 3: Perform softmax over all distorted logits
         softmax_samples  = F.softmax(logit_samples,dim=2)
-        #softmax_samples = torch.exp(-ce_loss_samples)
-        #Step 4: Take average of T samples
+        #Step 4: Take average of T distorted samples
         avg_softmax     = torch.mean(softmax_samples,dim=0)
-        #Step 5: Redo NLL
+        #Step 5: Perform negative log likelihood
         ce_loss         = F.nll_loss(torch.log(avg_softmax),targets)
         #Step 6: Add regularizer
-        ce_loss         += 0.01*torch.mean(cls_var)
-        #ce_loss         = -torch.log(avg_softmax)
+        ce_loss         += 0.05*torch.mean(cls_var)
+
+        #Compute mutual info from logit samples for display on tensorboard
         a_mutual_info   = self._categorical_mutual_information(logit_samples)
-        #targets_resize = targets.repeat(num_sample,1)
-        #distorted_ce = -F.cross_entropy(logits, targets_resize,reduction='none')
-        #ce_noise     = torch.log(distorted_ce) - undistorted_ce.repeat(num_sample,1)
-        #ce_noise_var = torch.var(ce_noise)
-        #ce_noise_var = torch.pow(-torch.log(torch.mean(torch.exp(ce_noise),dim=0)),2)
-        #ce_elu       = -1*torch.nn.functional.elu(-ce_noise)
-        #ce_var_loss  = ce_elu + undistorted_ce.repeat(num_sample,1)
-        #ce_var_loss  = torch.log(torch.mean(torch.exp(ce_var_loss),dim=0)+1e-9)
-        #regularizer   = torch.mean(ce_noise_mean)
-        #regularizer   = regularizer - 1
-        #regularizer   = torch.mean(torch.pow(ce_noise,2))
-        #distorted_ce = -torch.nn.functional.elu(-distorted_ce)
-        #ce_loss = -torch.log(torch.mean(torch.exp(-distorted_ce),dim=0))
-        #ce_loss = torch.mean(ce_loss)
-        #print('ce loss {}'.format(ce_loss))
-        #print('ce_var_loss {}'.format())
-        #print('reg {}'.format(regularizer))
-        #print('cls_var {}'.format(torch.mean(cls_var)))
         return ce_loss, a_mutual_info
 
     def _region_proposal(self, net_conv):
@@ -534,11 +490,8 @@ class Network(nn.Module):
         return rois
 
     #Used to dynamically change batch size depending on eval or train
-    def set_num_mc_run(self,num_mc_run):
-        self._num_mc_run = num_mc_run
-
-    def _region_classification(self, fc7):
-        raise NotImplementedError
+    def set_e_num_sample(self,e_num_sample):
+        self._e_num_sample = e_num_sample
 
     def _input_to_head(self):
         raise NotImplementedError
@@ -566,6 +519,139 @@ class Network(nn.Module):
 
         # Initialize layers
         self._init_modules()
+
+    #FYI this is a fancy way of instantiating a class and calling its main function
+    def _roi_pool_layer(self, bottom, rois):
+        #Has restriction on batch, only one dim allowed
+        return RoIPool((cfg.POOLING_SIZE, cfg.POOLING_SIZE),
+                       1.0 / float(self._feat_stride))(bottom, rois)
+
+    #torchvision.ops.RoIAlign(output_size, spatial_scale, sampling_ratio)
+    def _roi_align_layer(self, bottom, rois):
+        return RoIAlign((cfg.POOLING_SIZE, cfg.POOLING_SIZE), 1.0 / float(self._feat_stride),
+                        0)(bottom, rois)
+
+
+    def _head_to_tail(self, pool5, dropout_en):
+        pool5 = pool5.unsqueeze(0).repeat(self._e_num_sample,1,1,1,1)
+        pool5 = pool5.view(-1,pool5.shape[2],pool5.shape[3],pool5.shape[4])
+        #Reshape due to limitation on nn.conv2d (only one dim can be batch)
+        #pool5 = pool5.view(-1,pool5.shape[2],pool5.shape[3],pool5.shape[4])
+        fc7 = self.resnet.layer4(pool5).mean(3).mean(
+            2)  # average pooling after layer4
+        fc7 = fc7.unsqueeze(0).view(self._e_num_sample,-1,fc7.shape[1])
+        return fc7
+
+
+    def _region_classification(self, fc7):
+
+        #First pass through custom tail if epistemic uncertainty enabled
+        if(cfg.UC.EN_CLS_EPISTEMIC):
+            cls_score_in = self._cls_tail(fc7)
+        else:
+            cls_score_in = fc7
+        cls_score = self.cls_score_net(cls_score_in)
+        #if(cfg.UC.EN_BBOX_EPISTEMIC):
+        #    bbox_pred_in = self._bbox_tail(fc7)
+        #else:
+        bbox_pred_in = fc7
+
+        bbox_s_pred  = self.bbox_pred_net(bbox_pred_in)
+        if(cfg.NET_TYPE == 'lidar'):
+            heading_pred = self.heading_pred_net(bbox_pred_in)
+            bbox_z_pred  = self.bbox_z_pred_net(bbox_pred_in)
+            #Mix heading back into bbox pred
+            bbox_pred    = torch.cat((bbox_s_pred.view(self._e_num_sample,-1,cfg.IMAGE.NUM_BBOX_ELEM),bbox_z_pred.view(self._e_num_sample,-1,2),heading_pred.view(self._e_num_sample,-1,1)),dim=2)
+            bbox_pred    = bbox_pred.view(self._e_num_sample,-1,cfg.LIDAR.NUM_BBOX_ELEM*self._num_classes)
+        else:
+            bbox_pred = bbox_s_pred
+        cls_score_mean = torch.mean(cls_score,dim=0)
+        cls_pred = torch.max(cls_score_mean, 1)[1]
+        cls_prob = F.softmax(cls_score, dim=2)
+        cls_prob_mean = torch.mean(cls_prob,dim=0)
+
+        #Compute aleatoric unceratinty if computed
+        if(cfg.UC.EN_BBOX_ALEATORIC):
+            bbox_var  = self.bbox_al_var_net(fc7)
+            self._predictions['a_bbox_var']  = torch.mean(bbox_var,dim=0)
+        if(cfg.UC.EN_CLS_ALEATORIC):
+            a_cls_var   = self.cls_al_var_net(cls_score_in)
+            a_cls_var = torch.exp(torch.mean(a_cls_var,dim=0))
+            self._predictions['a_cls_var']   = a_cls_var
+
+        self._mc_run_output['bbox_pred'] = bbox_pred
+        self._mc_run_output['cls_score'] = cls_score
+        self._mc_run_output['cls_prob']  = cls_prob
+        self._predictions['cls_score'] = cls_score_mean
+        self._predictions['cls_pred'] = cls_pred
+        self._predictions['cls_prob'] = cls_prob_mean
+        #TODO: Make domain shift here
+        self._predictions['bbox_pred'] = torch.mean(bbox_pred,dim=0)
+
+    def _cls_tail(self,fc7):
+        fc7_reshape = fc7.view(-1,fc7.shape[2])
+        fc_dropout_rate   = 0.5
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        #fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+
+        out  = self.cls_fc1(fc7_reshape)
+        #out  = self.cls_bn1(out)
+        out  = fc_relu(out)
+        out  = fc_dropout1(out)
+        out  = self.cls_fc2(out)
+        #out  = self.cls_bn2(out)
+        out  = fc_relu(out)
+        out  = fc_dropout2(out)
+        #out   = self.cls_fc3(out)
+        #out   = fc_relu(out)
+        #out   = fc_dropout2(out)
+        out = out.view(fc7.shape[0],fc7.shape[1],-1)
+        return out
+
+    def _bbox_tail(self,fc7):
+        fc_dropout_rate   = 0.4
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+        fc1     = self.bbox_fc1(fc7)
+        fc1_r   = fc_relu(fc1)
+        fc1_d   = fc_dropout1(fc1_r)
+        fc2     = self.bbox_fc2(fc1_d)
+        fc2_r   = fc_relu(fc2)
+        fc2_d   = fc_dropout2(fc2_r)
+    #    fc3     = self.bbox_fc3(fc2_d)
+    #    fc3_r   = fc_relu(fc3)
+    #    fc3_d   = fc_dropout2(fc3_r)
+        return fc2_d
+
+    def _custom_tail(self,pool5,dropout_en):
+        pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._e_num_sample,1,1)
+        if(dropout_en):
+            conv_dropout_rate = 0.2
+            fc_dropout_rate   = 0.5
+        else:
+            conv_dropout_rate = 0.0
+            fc_dropout_rate   = 0.0
+        pool_dropout = nn.Dropout(conv_dropout_rate)
+        fc_dropout1   = nn.Dropout(fc_dropout_rate)
+        fc_dropout2   = nn.Dropout(fc_dropout_rate)
+        fc_dropout3   = nn.Dropout(fc_dropout_rate)
+        fc_dropout4   = nn.Dropout(fc_dropout_rate)
+        fc_relu      = nn.ReLU(inplace=True)
+        pool5_d = pool_dropout(pool5)
+        fc1     = self.t_fc1(pool5_d)
+        fc1_r   = fc_relu(fc1)
+        fc1_d   = fc_dropout1(fc1_r)
+        fc2     = self.t_fc2(fc1_d)
+        fc2_r   = fc_relu(fc2)
+        fc2_d   = fc_dropout2(fc2_r)
+        fc3     = self.t_fc3(fc2_d)
+        fc3_r   = fc_relu(fc3)
+        fc3_d   = fc_dropout3(fc3_r)
+        return fc3_d
 
     def _run_summary_op(self, val=False, summary_size=1):
         """
@@ -647,11 +733,11 @@ class Network(nn.Module):
             #del net_conv
             if self._mode == 'TRAIN':
                 #Find best algo
-                #self._num_mc_run = 1
+                #self._e_num_sample = 1
                 torch.backends.cudnn.benchmark = True  # benchmark because now the input size are fixed
             #elif(self._mode == 'TEST'):
-            #    self._num_mc_run = 10
-            if(cfg.ENABLE_EPISTEMIC_BBOX_VAR or cfg.ENABLE_EPISTEMIC_CLS_VAR):
+            #    self._e_num_sample = 10
+            if(cfg.UC.EN_BBOX_EPISTEMIC or cfg.UC.EN_CLS_EPISTEMIC):
                 dropout_en = True
             else:
                 dropout_en = False
@@ -659,7 +745,7 @@ class Network(nn.Module):
                 fc7 = self._custom_tail(pool5,dropout_en)
             else:
                 fc7 = self._head_to_tail(pool5,dropout_en)
-                fc7 = fc7.unsqueeze(0).repeat(self._num_mc_run,1,1)
+                #fc7 = fc7.unsqueeze(0).repeat(self._e_num_sample,1,1)
 
             self._region_classification(fc7)
             #self.timers['net'].toc()
@@ -752,27 +838,40 @@ class Network(nn.Module):
                     self._num_classes).unsqueeze(0).expand_as(bbox_pred)
                 #Denormalize bbox target predictions
                 bbox_mean = bbox_pred.mul(stds).add(means)
-                #bbox_var = self._predictions['a_bbox_var']
-                if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-                    bbox_gaussian = torch.distributions.Normal(0,torch.sqrt(torch.exp(self._predictions['a_bbox_var'])))
-                    bbox_samples = bbox_gaussian.sample((self._num_aleatoric_samples,)) + bbox_mean
-                    mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,self._frame_scale)
-                    #TODO: Maybe detach here?
-                    roi_coords = rois.unsqueeze(0).repeat(self._num_aleatoric_samples,1,1)
-                    roi_coords = roi_coords.view(-1,roi_coords.shape[2])
-                    bbox_samples = bbox_samples.view(-1,bbox_samples.shape[2])
-                    bbox_inv_samples = bbox_transform_inv(roi_coords,bbox_samples,self._frame_scale)
-                    bbox_inv_samples = bbox_inv_samples.view(self._num_aleatoric_samples,-1,bbox_inv_samples.shape[1])
-                    bbox_inv_var = self._compute_bbox_var(bbox_inv_samples)
-                    self._predictions['bbox_inv_pred']  = mean_bbox_inv
-                    self._predictions['a_bbox_inv_var'] = bbox_inv_var
-                else:
+                anchors_3d = self._predictions['anchors_3d']
+                rois = self._predictions['rois'][:,1:5]
+                #TODO: Clean up to speed up - how to extract variance without inversion
+                if(cfg.UC.EN_BBOX_ALEATORIC):
+                    a_bbox_var = torch.exp(self._predictions['a_bbox_var'])
                     if(self._net_type == 'image'):
-                        mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,self._frame_scale)
+                        uncertainty_inv = uncertainty_transform_inv(rois,bbox_mean,a_bbox_var,self._frame_scale)
                     elif(self._net_type == 'lidar'):
-                        mean_bbox_inv = lidar_3d_bbox_transform_inv(self._predictions['rois'][:,1:5],self._predictions['anchors_3d'],bbox_mean,self._frame_scale)
-                    
-                    self._predictions['bbox_inv_pred'] = mean_bbox_inv
+                        uncertainty_inv = lidar_3d_uncertainty_transform_inv(rois,anchors_3d,bbox_mean,a_bbox_var,self._frame_scale)
+                    self._predictions['a_bbox_var_inv'] = uncertainty_inv
+
+                    #bbox_gaussian = torch.distributions.Normal(0,torch.sqrt(torch.exp(self._predictions['a_bbox_var'])))
+                    #bbox_samples = bbox_gaussian.sample((cfg.UC.A_NUM_BBOX_SAMPLE,)) + bbox_mean
+                    #TODO: Maybe detach here?
+                    #roi_coords = rois.unsqueeze(0).repeat(cfg.UC.A_NUM_BBOX_SAMPLE,1,1)
+                    #roi_coords = roi_coords.view(-1,roi_coords.shape[2])
+                    #bbox_samples = bbox_samples.view(-1,bbox_samples.shape[2])
+                    #anchor_3d_coords = anchors_3d.unsqueeze(0).repeat(cfg.UC.A_NUM_BBOX_SAMPLE,1,1)
+                    #anchor_3d_coords = anchor_3d_coords.view(-1,anchor_3d_coords.shape[2])
+                    #if(self._net_type == 'image'):
+                    #    bbox_inv_samples = bbox_transform_inv(roi_coords,bbox_samples,self._frame_scale)
+                    #elif(self._net_type == 'lidar'):
+                    #    bbox_inv_samples = lidar_3d_bbox_transform_inv(roi_coords,anchor_3d_coords,bbox_samples,self._frame_scale)
+                    #bbox_inv_samples = bbox_inv_samples.view(cfg.UC.A_NUM_BBOX_SAMPLE,-1,bbox_inv_samples.shape[1])
+                    #bbox_inv_var = self._compute_bbox_var(bbox_inv_samples)
+                    #self._predictions['a_bbox_var_inv'] = bbox_inv_var
+
+                #Traditional bbox output
+                if(self._net_type == 'image'):
+                    mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,self._frame_scale)
+                elif(self._net_type == 'lidar'):
+                    mean_bbox_inv = lidar_3d_bbox_transform_inv(self._predictions['rois'][:,1:5],anchors_3d,bbox_mean,self._frame_scale)
+                
+                self._predictions['bbox_inv_pred'] = mean_bbox_inv
 
         #Reset to mode == VAL
         self._mode = mode
@@ -790,12 +889,13 @@ class Network(nn.Module):
         scale = info[6]
         with torch.no_grad():
             self.forward(frame, info, None, None, mode='TEST')
-        cls_score, cls_prob, bbox_pred, rois = self._predictions["cls_score"].data.cpu().detach(), \
+        cls_score, cls_prob, bbox_pred, rois, anchors_3d = self._predictions["cls_score"].data.cpu().detach(), \
                                                          self._predictions['cls_prob'].data.detach(), \
                                                          self._predictions['bbox_inv_pred'].data.detach(), \
-                                                         self._predictions['rois'].data.detach()
+                                                         self._predictions['rois'].data.detach(), \
+                                                         self._predictions['anchors_3d'].data.detach()
         #a_bbox_var, e_bbox_var, a_cls_entropy, a_cls_var, e_cls_mutual_info
-        uncertainties = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,scale)
+        uncertainties = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,anchors_3d,scale)
         return cls_score, cls_prob, bbox_pred, rois, uncertainties
 
     def delete_intermediate_states(self):
@@ -821,8 +921,8 @@ class Network(nn.Module):
             cls_prob          = self._predictions['cls_prob'].data.detach() #(self._fc7_channels, self._num_classes)
             rois              = self._predictions['rois'].data.detach()/scale
             roi_labels        = self._proposal_targets['labels'].data.detach()
-
-            uncertainties = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,blobs['info'][6])
+            anchors_3d        = self._predictions['anchors_3d'].data.detach()
+            uncertainties = self._uncertainty_postprocess(bbox_pred,cls_prob,rois,anchors_3d,blobs['info'][6])
         else:
             summary    = None
             bbox_pred  = self._predictions['rois'][:,1:5]/scale
@@ -840,48 +940,59 @@ class Network(nn.Module):
         self.delete_intermediate_states()
         return summary, rois, roi_labels, cls_prob, bbox_pred, uncertainties
 
-    def _uncertainty_postprocess(self,bbox_pred,cls_prob,rois,im_scale):
+    def _uncertainty_postprocess(self,bbox_pred,cls_prob,rois,anchors_3d,frame_scale):
         uncertainties = {}
-        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            uncertainties['a_bbox_var'] = self._predictions['a_bbox_inv_var'].data.detach() #(self._fc7_channels, self._num_classes * 4)
-        else:
-            uncertainties['a_bbox_var'] = None
-        if(cfg.ENABLE_ALEATORIC_BBOX_VAR):
-            cls_prob = self._predictions['cls_prob'] #(self._fc7_channels, self._num_classes * 4)
+        if(cfg.UC.EN_BBOX_ALEATORIC):
+            uncertainties['a_bbox_var'] = torch.exp(self._predictions['a_bbox_var']).data.detach()
+        #else:
+            #uncertainties['a_bbox_var'] = None
+        if(cfg.UC.EN_CLS_ALEATORIC):
+            cls_prob  = self._predictions['cls_prob']
+            cls_score = self._predictions['cls_score']
+            cls_var   = self._predictions['a_cls_var']
             #TODO: This should not be taking the mean yet, we need to filter by top indices
             #a_cls_entropy = -torch.mean(a_cls_entropy)*torch.log(torch.mean(a_cls_entropy)) - (1-torch.mean(a_cls_entropy))*torch.log(1-torch.mean(a_cls_entropy))
-            a_cls_entropy                   = self._categorical_entropy(cls_prob)
-            uncertainties['a_cls_entropy']  = a_cls_entropy.data.detach()
-            uncertainties['a_cls_var']      = self._predictions['a_cls_var']
-            #Compute class entropy
-        else:
-            uncertainties['a_cls_entropy'] = None
-            uncertainties['a_cls_var']     = None
-        #if(cfg.ENABLE_ALEATORIC_CLS_VAR):
-        #    cls_var = self._predictions['cls_var'].data.detach().cpu().numpy() #(self._fc7_channels, self._num_classes * 4)
-        #else:
-        #    cls_var = None
+            a_cls_entropy                      = self._categorical_entropy(cls_prob)
+            distorted_cls_score                = self._logit_distort(cls_score,cls_var,cfg.UC.A_NUM_CE_SAMPLE)
+            a_cls_mutual_info                  = self._categorical_mutual_information(distorted_cls_score)
+            uncertainties['a_cls_entropy']     = a_cls_entropy.data.detach()
+            uncertainties['a_cls_var']         = cls_var
+            uncertainties['a_cls_mutual_info'] = a_cls_mutual_info
+
         #For tensorboard
-        if(cfg.ENABLE_EPISTEMIC_CLS_VAR):
+        if(cfg.UC.EN_CLS_EPISTEMIC):
             e_cls_score = self._mc_run_output['cls_score'].detach()
+            e_cls_prob  = self._mc_run_output['cls_prob'].detach()
+            e_cls_prob_mean = torch.mean(e_cls_prob,dim=0)
             #Compute average entropy via mutual information
             e_cls_mutual_info = self._categorical_mutual_information(e_cls_score)
             uncertainties['e_cls_mutual_info'] = e_cls_mutual_info
             self._mc_run_results['e_cls_mutual_info'] = torch.mean(e_cls_mutual_info)
-            self._mc_run_output['e_cls_mutual_info'] = e_cls_mutual_info
-        else:
-            uncertainties['e_cls_mutual_info'] = torch.tensor([0])
+            #self._mc_run_output['e_cls_mutual_info']  = e_cls_mutual_info
+            e_cls_entropy     = self._categorical_entropy(e_cls_prob_mean)
+            uncertainties['e_cls_entropy']            = e_cls_entropy
+            self._mc_run_results['e_cls_entropy']     = torch.mean(e_cls_entropy)
+            #self._mc_run_output['e_cls_entropy']      = e_cls_entropy
+        #else:
+        #    uncertainties['e_cls_mutual_info'] = torch.tensor([0])
 
-        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR):
+        if(cfg.UC.EN_BBOX_EPISTEMIC):
             #All of this to simply get the predictions from [M,N,C] to [M*N,C] interleaved.
             #This is to not change bbox_transform_inv
             mc_bbox_pred = self._mc_run_output['bbox_pred']
             mc_bbox_pred = mc_bbox_pred.view(-1,mc_bbox_pred.shape[2])
             roi_sampled = rois[:,1:]
-            roi_sampled = roi_sampled.unsqueeze(0).repeat(self._num_mc_run,1,1)
+            roi_sampled = roi_sampled.unsqueeze(0).repeat(self._e_num_sample,1,1)
             roi_sampled = roi_sampled.view(-1,roi_sampled.shape[2])
-            mc_bbox_pred = bbox_transform_inv(roi_sampled,mc_bbox_pred,im_scale)
-            mc_bbox_pred = mc_bbox_pred.view(self._num_mc_run,-1,mc_bbox_pred.shape[1])
+
+
+            if(cfg.NET_TYPE == 'image'):
+                mc_bbox_pred = bbox_transform_inv(roi_sampled,mc_bbox_pred,frame_scale)
+            elif(cfg.NET_TYPE == 'lidar'):
+                anchor_3d_sampled = anchors_3d.unsqueeze(0).repeat(self._e_num_sample,1,1)
+                anchor_3d_sampled = anchor_3d_sampled.view(-1,anchor_3d_sampled.shape[2])
+                mc_bbox_pred = lidar_3d_bbox_transform_inv(roi_sampled,anchor_3d_sampled,mc_bbox_pred,frame_scale)
+            mc_bbox_pred = mc_bbox_pred.view(self._e_num_sample,-1,mc_bbox_pred.shape[1])
             #Way #1 to compute bbox var
             #mc_bbox_covar = self._compute_bbox_cov(mc_bbox_pred)
             #Way #2 to compute bbox var
@@ -893,9 +1004,9 @@ class Network(nn.Module):
             self._mc_run_output['e_bbox_var'] = e_bbox_var
             self._mc_run_results['e_bbox_var'] = torch.mean(e_bbox_var)
             #Compute average variance
-        else:
-            uncertainties['e_bbox_var'] = torch.tensor([0])
-        if(cfg.ENABLE_EPISTEMIC_BBOX_VAR or cfg.ENABLE_EPISTEMIC_CLS_VAR):
+        #else:
+        #    uncertainties['e_bbox_var'] = torch.tensor([0])
+        if(cfg.UC.EN_BBOX_EPISTEMIC or cfg.UC.EN_CLS_EPISTEMIC):
             for k in self._mc_run_results.keys():
                 if(k in self._val_event_summaries):
                     self._val_event_summaries[k] += self._mc_run_results[k].item()
