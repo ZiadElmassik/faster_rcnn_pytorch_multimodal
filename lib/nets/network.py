@@ -70,7 +70,6 @@ class Network(nn.Module):
             #    self._cum_loss_keys.append('ry_loss')
             if(cfg.UC.EN_CLS_ALEATORIC):
                 self._cum_loss_keys.append('a_cls_var')
-                self._cum_loss_keys.append('a_entropy')
             if(cfg.UC.EN_BBOX_ALEATORIC):
                 self._cum_loss_keys.append('a_bbox_var')
         self._cum_gt_entries                  = 0
@@ -259,6 +258,9 @@ class Network(nn.Module):
             #Don't need covariance matrix as it collapses itself in the end anyway
             in_loss_box = 0.5*in_loss_box*torch.exp(-bbox_var) + 0.5*torch.exp(bbox_var)
             in_loss_box = in_loss_box*bbox_inside_weights
+            #torch.set_printoptions(profile="full")
+            #print(in_loss_box[in_loss_box.nonzero()])
+            #torch.set_printoptions(profile="default")
         #Used to normalize the predictions, this is only used in the RPN
         #By default negative(background) and positive(foreground) samples have equal weighting
         out_loss_box = bbox_outside_weights * in_loss_box
@@ -325,13 +327,11 @@ class Network(nn.Module):
             if(cfg.UC.EN_CLS_ALEATORIC):
                 a_cls_var  = self._predictions['a_cls_var']
                 cross_entropy, a_cls_mutual_info = self._bayesian_cross_entropy(cls_score, a_cls_var, label,cfg.UC.A_NUM_CE_SAMPLE)
-                self._losses['a_entropy'] = torch.mean(a_cls_mutual_info)
                 self._losses['a_cls_var']     = torch.mean(a_cls_var)
                 #Classical entropy w/out logit sampling
                 #self._losses['a_entropy'] = torch.mean(self._categorical_entropy(cls_prob))
             else:
                 cross_entropy = F.cross_entropy(cls_score, label)
-                self._losses['a_entropy'] = torch.tensor(0)
             #Compute aleatoric bbox variance
             if(cfg.UC.EN_BBOX_ALEATORIC):
                 #Grab a local variable for a_bbox_var
@@ -556,14 +556,14 @@ class Network(nn.Module):
             bbox_pred_in = fc7
 
         bbox_s_pred  = self.bbox_pred_net(bbox_pred_in)
-        if(cfg.NET_TYPE == 'lidar'):
-            heading_pred = self.heading_pred_net(bbox_pred_in)
-            bbox_z_pred  = self.bbox_z_pred_net(bbox_pred_in)
-            #Mix heading back into bbox pred
-            bbox_pred    = torch.cat((bbox_s_pred.view(self._e_num_sample,-1,cfg.IMAGE.NUM_BBOX_ELEM),bbox_z_pred.view(self._e_num_sample,-1,2),heading_pred.view(self._e_num_sample,-1,1)),dim=2)
-            bbox_pred    = bbox_pred.view(self._e_num_sample,-1,cfg.LIDAR.NUM_BBOX_ELEM*self._num_classes)
-        else:
-            bbox_pred = bbox_s_pred
+        #if(cfg.NET_TYPE == 'lidar'):
+        #    heading_pred = self.heading_pred_net(bbox_pred_in)
+        #    bbox_z_pred  = self.bbox_z_pred_net(bbox_pred_in)
+        #    #Mix heading back into bbox pred
+        #    bbox_pred    = torch.cat((bbox_s_pred.view(self._e_num_sample,-1,cfg.IMAGE.NUM_BBOX_ELEM),bbox_z_pred.view(self._e_num_sample,-1,2),heading_pred.view(self._e_num_sample,-1,1)),dim=2)
+        #    bbox_pred    = bbox_pred.view(self._e_num_sample,-1,cfg.LIDAR.NUM_BBOX_ELEM*self._num_classes)
+        #else:
+        bbox_pred = bbox_s_pred
         cls_score_mean = torch.mean(cls_score,dim=0)
         cls_pred = torch.max(cls_score_mean, 1)[1]
         cls_prob = F.softmax(cls_score, dim=2)
@@ -571,7 +571,7 @@ class Network(nn.Module):
 
         #Compute aleatoric unceratinty if computed
         if(cfg.UC.EN_BBOX_ALEATORIC):
-            bbox_var  = self.bbox_al_var_net(fc7)
+            bbox_var  = self.bbox_al_var_net(bbox_pred_in)
             self._predictions['a_bbox_var']  = torch.mean(bbox_var,dim=0)
         if(cfg.UC.EN_CLS_ALEATORIC):
             a_cls_var   = self.cls_al_var_net(cls_score_in)
@@ -594,8 +594,8 @@ class Network(nn.Module):
         #fc_dropout2   = nn.Dropout(fc_dropout_rate)
         #fc_dropout3   = nn.Dropout(fc_dropout_rate)
         fc_relu      = nn.ReLU(inplace=True)
-
-        out  = self.cls_fc1(fc7_reshape)
+        out  = self.cls_drop1(fc7_reshape)
+        out  = self.cls_fc1(out)
         out  = self.cls_bn1(out)
         out  = fc_relu(out)
         out  = self.cls_drop1(out)
@@ -865,6 +865,8 @@ class Network(nn.Module):
                         anchor_3d_coords = anchors_3d.unsqueeze(0).repeat(cfg.UC.A_NUM_BBOX_SAMPLE,1,1)
                         anchor_3d_coords = anchor_3d_coords.view(-1,anchor_3d_coords.shape[2])
                         bbox_inv_samples = lidar_3d_bbox_transform_inv(roi_coords,anchor_3d_coords,bbox_samples,self._frame_scale)
+                        area_extents = [cfg.LIDAR.X_RANGE[0],cfg.LIDAR.Y_RANGE[0],cfg.LIDAR.Z_RANGE[0],cfg.LIDAR.X_RANGE[1],cfg.LIDAR.Y_RANGE[1],cfg.LIDAR.Z_RANGE[1]]
+                        bbox_inv_samples = bbox_utils.bbox_voxel_grid_to_pc(bbox_inv_samples,area_extents,info)
                     bbox_inv_samples = bbox_inv_samples.view(cfg.UC.A_NUM_BBOX_SAMPLE,-1,bbox_inv_samples.shape[1])
                     bbox_inv_var = self._compute_bbox_var(bbox_inv_samples)
                     self._predictions['a_bbox_var_inv'] = bbox_inv_var
