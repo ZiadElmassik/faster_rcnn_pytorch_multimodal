@@ -1108,9 +1108,9 @@ class Network(nn.Module):
             rois    = rois.data.cpu().numpy()
             #Extract XC,YC and L,W
             targets = sel_targets
-            stds = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_STDS).unsqueeze(0).expand_as(targets)
-            means = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
-            targets = targets.mul(stds).add(means)
+            #stds = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_STDS).unsqueeze(0).expand_as(targets)
+            #means = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
+            targets = targets.mul(self._bbox_stds).add(self._bbox_means)
             targets = targets.view(-1,7)
             anchors = lidar_3d_bbox_transform_inv(rois,anchors_3d,targets)
             anchors = anchors.data.cpu().numpy()
