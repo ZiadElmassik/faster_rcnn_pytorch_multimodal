@@ -181,9 +181,6 @@ class Network(nn.Module):
         return rois, roi_scores, anchors_3d
 
     def _anchor_component(self, height, width):
-        # just to get the shape right
-        #height = int(math.ceil(self._info.data[0, 0] / self._feat_stride[0]))
-        #width = int(math.ceil(self._info.data[0, 1] / self._feat_stride[0]))
         if(self._net_type == 'image'):
             anchors, anchor_length = generate_anchors_pre(\
                                                 height, width,
@@ -425,10 +422,10 @@ class Network(nn.Module):
         if(cfg.UC.EN_CLS_EPISTEMIC):
             self.cls_fc1        = nn.Linear(self._fc7_channels, self._det_net_channels*2)
             self.cls_bn1        = nn.BatchNorm1d(self._det_net_channels*2)
-            self.cls_drop1      = nn.Dropout(self._fc_drop_rate)
+            self.cls_drop1      = nn.Dropout(self._cls_drop_rate)
             self.cls_fc2        = nn.Linear(self._det_net_channels*2, self._det_net_channels)
             self.cls_bn2        = nn.BatchNorm1d(self._det_net_channels)
-            self.cls_drop2      = nn.Dropout(self._fc_drop_rate)
+            self.cls_drop2      = nn.Dropout(self._cls_drop_rate)
         #    self.cls_fc3        = nn.Linear(self._det_net_channels*2, self._det_net_channels)
 
         #Traditional outputs
@@ -517,7 +514,7 @@ class Network(nn.Module):
             self._predictions['a_bbox_var']  = torch.mean(bbox_var,dim=0)
         if(cfg.UC.EN_CLS_ALEATORIC):
             a_cls_var   = self.cls_al_var_net(cls_score_in)
-            a_cls_var = torch.exp(torch.mean(a_cls_var,dim=0))
+            a_cls_var = torch.exp(torch.mean(a_cls_var,dim=0))  #exp of mean or mean of exp?
             self._predictions['a_cls_var']   = a_cls_var
 
         self._mc_run_output['bbox_pred'] = bbox_pred
@@ -893,8 +890,6 @@ class Network(nn.Module):
 
     def _uncertainty_postprocess(self,bbox_pred,cls_prob,rois,anchors_3d,frame_scale):
         uncertainties = {}
-        #else:
-            #uncertainties['a_bbox_var'] = None
         if(cfg.UC.EN_CLS_ALEATORIC):
             cls_prob  = self._predictions['cls_prob']
             cls_score = self._predictions['cls_score']
@@ -924,13 +919,22 @@ class Network(nn.Module):
         #    uncertainties['e_mutual_info'] = torch.tensor([0])
 
         if(cfg.UC.EN_BBOX_ALEATORIC):
-            uncertainties['a_bbox_var'] = torch.exp(self._predictions['a_bbox_var']).data.detach()
+            #Grab after bbox are transformed into pc space and MC sampling occurs
+            uncertainties['a_bbox_var'] = self._predictions['a_bbox_var_inv'].data.detach()
+            #Grab directly from output of deltas
+            #uncertainties['a_bbox_var'] = torch.exp(self._predictions['a_bbox_var']).data.detach()
 
         if(cfg.UC.EN_BBOX_EPISTEMIC):
             #All of this to simply get the predictions from [M,N,C] to [M*N,C] interleaved.
             #This is to not change bbox_transform_inv
+            #TODO: add mean and std deviation
             mc_bbox_pred = self._mc_run_output['bbox_pred']
             mc_bbox_pred = mc_bbox_pred.view(-1,mc_bbox_pred.shape[2])
+            stds = mc_bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_STDS).repeat(
+                self._num_classes).unsqueeze(0).expand_as(mc_bbox_pred)
+            means = mc_bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).repeat(
+                self._num_classes).unsqueeze(0).expand_as(mc_bbox_pred)
+            mc_bbox_pred = mc_bbox_pred.mul(stds).add(means)
             roi_sampled = rois[:,1:]
             roi_sampled = roi_sampled.unsqueeze(0).repeat(self._e_num_sample,1,1)
             roi_sampled = roi_sampled.view(-1,roi_sampled.shape[2])
