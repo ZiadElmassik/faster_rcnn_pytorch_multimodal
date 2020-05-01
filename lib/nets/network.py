@@ -59,6 +59,9 @@ class Network(nn.Module):
         self._frame_scale      = 1.0
         self._proposal_cnt     = 0
         self._device           = 'cuda'
+        self._net_type                        = cfg.NET_TYPE
+        self._bbox_means = torch.tensor(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).to(device=self._device)
+        self._bbox_stds = torch.tensor(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_STDS).to(device=self._device)
         self._cum_loss_keys    = ['total_loss','rpn_cross_entropy','rpn_loss_box']
         #self._cum_loss_keys    = ['total_loss','rpn_cross_entropy','rpn_loss_box','cross_entropy','loss_box']
         if(cfg.ENABLE_FULL_NET):
@@ -74,7 +77,6 @@ class Network(nn.Module):
         self._batch_gt_entries                = 0
         self._cum_im_entries                  = 0
         self._e_num_sample                    = 1
-        self._net_type                        = cfg.NET_TYPE
         #Set on every forward pass for use with proposal target layer
         self._gt_boxes      = None
         self._true_gt_boxes = None
@@ -773,13 +775,9 @@ class Network(nn.Module):
                 bbox_pred = self._predictions['bbox_pred']
                 rois      = self._predictions['rois'][:,1:]
                 #bbox_targets are pre-normalized for loss, so modifying here.
-                #Expand as -> broadcast 
-                stds = bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_STDS).repeat(
-                    self._num_classes).unsqueeze(0).expand_as(bbox_pred)
-                means = bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).repeat(
-                    self._num_classes).unsqueeze(0).expand_as(bbox_pred)
                 #Denormalize bbox target predictions
-                bbox_mean = bbox_pred.mul(stds).add(means)
+                bbox_mean = bbox_pred.mul(self._bbox_stds.repeat(self._num_classes)).add(self._bbox_means.repeat(self._num_classes))
+                #bbox_mean = bbox_pred.mul(self._bbox_stds).add(self._bbox_means)
                 anchors_3d = self._predictions['anchors_3d']
                 rois = self._predictions['rois'][:,1:5]
                 #TODO: Clean up to speed up - how to extract variance without inversion
@@ -930,11 +928,14 @@ class Network(nn.Module):
             #TODO: add mean and std deviation
             mc_bbox_pred = self._mc_run_output['bbox_pred']
             mc_bbox_pred = mc_bbox_pred.view(-1,mc_bbox_pred.shape[2])
-            stds = mc_bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_STDS).repeat(
-                self._num_classes).unsqueeze(0).expand_as(mc_bbox_pred)
-            means = mc_bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).repeat(
-                self._num_classes).unsqueeze(0).expand_as(mc_bbox_pred)
-            mc_bbox_pred = mc_bbox_pred.mul(stds).add(means)
+            #if(self._mc_bbox_stds is None):
+            #    self._mc_bbox_stds = mc_bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_STDS).repeat(
+            #        self._num_classes).unsqueeze(0).expand_as(mc_bbox_pred)
+            #if(self._mc_bbox_means is None):
+            #    self._mc_bbox_means = mc_bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).repeat(
+            #        self._num_classes).unsqueeze(0).expand_as(mc_bbox_pred)
+            #mc_bbox_pred = mc_bbox_pred.mul(self._mc_bbox_stds).add(self._mc_bbox_means)
+            mc_bbox_pred = mc_bbox_pred.mul(self._bbox_stds.repeat(self._num_classes)).add(self._bbox_means.repeat(self._num_classes))
             roi_sampled = rois[:,1:]
             roi_sampled = roi_sampled.unsqueeze(0).repeat(self._e_num_sample,1,1)
             roi_sampled = roi_sampled.view(-1,roi_sampled.shape[2])
@@ -1163,9 +1164,9 @@ class Network(nn.Module):
             rois = rois[:,1:5]
             #Extract XC,YC and L,W
             targets = sel_targets
-            stds = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_STDS).unsqueeze(0).expand_as(targets)
-            means = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
-            targets = targets.mul(stds).add(means)
+            #stds = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_STDS).unsqueeze(0).expand_as(targets)
+            #means = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
+            targets = targets.mul(self._bbox_stds).add(self._bbox_means)
         rois = rois.view(-1,4)
         targets = targets.view(-1,4)
         anchors = bbox_transform_inv(rois,targets)
