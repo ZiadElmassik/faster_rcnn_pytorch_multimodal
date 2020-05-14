@@ -465,6 +465,8 @@ class Network(nn.Module):
             c3 = self._layers['layer2'](c2)
             c4 = self._layers['layer3'](c3)
             net_conv = self._layers['fpn'](c2, c3, c4)
+            if(cfg.NET_TYPE == 'image'):
+                net_conv = self._layers['fpn_downsample'](net_conv)
         else:   
             net_conv = self._layers['head'](frame)
 
@@ -476,8 +478,7 @@ class Network(nn.Module):
         #pool5 = pool5.view(-1,pool5.shape[2],pool5.shape[3],pool5.shape[4])
         #Reshape due to limitation on nn.conv2d (only one dim can be batch)
         #pool5 = pool5.view(-1,pool5.shape[2],pool5.shape[3],pool5.shape[4])
-        fc7 = self.resnet.layer4(pool5).mean(3).mean(
-            2)  # average pooling after layer4
+        fc7 = self.resnet.layer4(pool5).mean(3).mean(2)  # average pooling after layer4
         #fc7 = fc7.unsqueeze(0).view(self._e_num_sample,-1,fc7.shape[1])
         #fc7 = torch.nn.ReLU(fc7)
         return fc7
@@ -1148,12 +1149,13 @@ class Network(nn.Module):
 
     def _draw_and_save_image_targets(self,frame,targets,rois,labels,mask,target_type,out_file):
         frame = frame[0]*cfg.PIXEL_STDDEVS + cfg.PIXEL_MEANS
+        frame = frame[:,:,cfg.PIXEL_ARRANGE_BGR]
         frame = frame.astype(dtype=np.uint8)
         img = Image.fromarray(frame,'RGB')
         draw = ImageDraw.Draw(img)
         if(target_type == 'anchor'):
             mask   = mask.view(-1,4)
-            labels = labels.permute(0,2,3,1).reshape(-1)
+            labels = labels.permute(0,2,3,1)
         #if(target_type == 'anchor'):
         if(target_type == 'proposal'):
             #Target is in a (N,K*7) format, transform to (N,7) where corresponding label dictates what class bbox belongs to 
@@ -1168,6 +1170,7 @@ class Network(nn.Module):
             #means = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
             targets = targets.mul(self._bbox_stds).add(self._bbox_means)
         rois = rois.view(-1,4)
+        labels = labels.reshape(-1)
         targets = targets.view(-1,4)
         anchors = bbox_transform_inv(rois,targets)
         label_mask = labels + 1
@@ -1176,13 +1179,14 @@ class Network(nn.Module):
         #else:
         #    anchors = bbox_3d_transform_inv_all_boxes(anchors_3d,targets)
             #anchors = 3d_to_bev(anchors)
-        for i, bbox in enumerate(anchors.view(-1,4)):
-            bbox_mask = mask[i]
-            bbox_label = int(labels[i])
-            roi        = rois[i]
+        for idx in label_idx:
+            bbox       = anchors[idx]
+            bbox_mask  = mask[idx]
+            bbox_label = int(labels[idx])
+            roi        = rois[idx]
             np_bbox = None
             #if(torch.mean(bbox_mask) > 0):
-            if(bbox_label == 1):
+            if(bbox_label >= 1):
                 np_bbox = bbox.data.cpu().numpy()
                 draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
                 draw.rectangle(np_bbox,width=1,outline='green')
