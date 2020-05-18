@@ -12,7 +12,6 @@ from model.train_val import train_net
 from model.config import cfg, cfg_from_file, cfg_from_list, get_output_dir, get_output_tb_dir
 from datasets.factory import get_imdb
 from datasets.kitti_imdb import kitti_imdb
-from datasets.nuscenes_imdb import nuscenes_imdb
 from datasets.waymo_imdb import waymo_imdb
 from datasets.waymo_lidb import waymo_lidb
 import datasets.imdb
@@ -26,7 +25,7 @@ from nets.vgg16 import vgg16
 from nets.imagenet import imagenet
 from nets.lidarnet import lidarnet
 from nets.mobilenet_v1 import mobilenetv1
-
+manual_mode = False
 #https://stackoverflow.com/questions/46561390/4-step-alternating-rpn-faster-r-cnn-training-tensorflow-object-detection-mo/46981671#46981671
 #https://arthurdouillard.com/post/faster-rcnn/
 #Alternate sharing: 
@@ -140,6 +139,12 @@ def parse_args(manual_mode=False):
         help='scale factor for frame',
         default=None,
         type=float)
+    parser.add_argument(
+        '--data_dir',
+        dest='data_dir',
+        help='Specifies the root data directory',
+        default=None,
+        type=str)
     if len(sys.argv) == 1 and manual_mode is False:
         parser.print_help()
         sys.exit(1)
@@ -222,8 +227,8 @@ def combined_imdb_roidb(mode,dataset,draw_and_save=False,imdb=None,limiter=0):
 
 
 if __name__ == '__main__':
-    cfg.DEBUG.EN = False
-    manual_mode = cfg.DEBUG.EN
+    cfg.DEBUG.EN = True 
+    #manual_mode = cfg.DEBUG.EN
     args = parse_args(manual_mode)
     #TODO: Config new image size
     if(manual_mode):
@@ -274,7 +279,8 @@ if __name__ == '__main__':
             args.weights_file = os.path.join('/home/mat/thesis/data/', 'weights', '{}-caffe.pth'.format(args.net))
     if(args.scale is not None):
         cfg.TRAIN.SCALES = (args.scale,)
-
+    if(args.data_dir is not None):
+        cfg.DATA_DIR = args.data_dir
     if(args.en_epistemic == 1):
         cfg.UC.EN_BBOX_EPISTEMIC = True
         cfg.UC.EN_CLS_EPISTEMIC  = True
