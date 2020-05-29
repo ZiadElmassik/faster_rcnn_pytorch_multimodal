@@ -249,10 +249,12 @@ def load_recs(frameset, frame_path, labels_filename, db, mode, classname):
             tmp_rec = load_rec(labels,frame_path,frame_idx,filename,db,mode)
             if(tmp_rec is None):
                 tmp_rec = {}
-                print('skipping frame {}, it does not exist in the ROIDB'.format(filename))
+                if(cfg.DEBUG.EN_TEST_MSG):
+                    print('skipping frame {}, it does not exist in the ROIDB'.format(filename))
                 tmp_rec['ignore_frame'] = True
             elif(tmp_rec['boxes'].size == 0):
-                print('skipping frame {}, as it has no GT boxes'.format(filename))
+                if(cfg.DEBUG.EN_TEST_MSG):
+                    print('skipping frame {}, as it has no GT boxes'.format(filename))
                 tmp_rec['ignore_frame'] = True
             else:
                 tmp_rec['ignore_frame'] = False
@@ -276,7 +278,7 @@ def load_recs(frameset, frame_path, labels_filename, db, mode, classname):
             #List of all frames with GT boxes for a specific class
             class_recs.append(tmp_rec)
             #Only print every hundredth annotation?
-            if i % 10 == 0:
+            if i % 10 == 0 and cfg.DEBUG.EN_TEST_MSG:
                 #print(recs[idx_name])
                 print('Reading annotation for {:d}/{:d}'.format(
                     i + 1, len(frameset)))

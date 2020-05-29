@@ -16,8 +16,9 @@ import torch.nn.functional as F
 import sys
 from PIL import Image, ImageDraw
 import os
-
+from collections import OrderedDict
 import utils.timer
+import utils.torchpoolers as torchpooler
 
 from layer_utils.snippets import generate_anchors_pre
 from layer_utils.generate_3d_anchors import GridAnchor3dGenerator
@@ -29,6 +30,7 @@ from utils.visualization import draw_bounding_boxes
 from model.bbox_transform import bbox_transform_inv, lidar_3d_bbox_transform_inv, clip_boxes, lidar_3d_uncertainty_transform_inv, uncertainty_transform_inv
 
 from torchvision.ops import RoIAlign, RoIPool
+from torchvision.ops.poolers import MultiScaleRoIAlign
 from model.config import cfg
 import utils.bbox as bbox_utils
 import tensorboardX as tb
@@ -58,6 +60,7 @@ class Network(nn.Module):
         self._anchor_cnt       = 0
         self._frame_scale      = 1.0
         self._proposal_cnt     = 0
+        self._anchors          = None
         self._device           = 'cuda'
         self._net_type                        = cfg.NET_TYPE
         self._bbox_means = torch.tensor(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).to(device=self._device)
@@ -125,13 +128,13 @@ class Network(nn.Module):
     def _proposal_top_layer(self, rpn_cls_prob, rpn_bbox_pred):
         rois, rpn_scores, anchors = proposal_top_layer(\
                                         rpn_cls_prob, rpn_bbox_pred, self._info,
-                                         self._feat_stride, self._anchors, self._num_anchors)
+                                        self._anchors, self._num_anchors)
         return rois, rpn_scores
 
     def _proposal_layer(self, rpn_cls_prob, rpn_bbox_pred):
         rois, rpn_scores, anchors_3d = proposal_layer(\
                                         rpn_cls_prob, rpn_bbox_pred, self._info, self._mode,
-                                         self._feat_stride, self._anchors, self._anchors_3d, self._num_anchors)
+                                        self._anchors, self._anchors_3d, self._num_anchors)
         return rois, rpn_scores, anchors_3d
 
     def _anchor_target_layer(self, rpn_cls_score):
@@ -144,7 +147,7 @@ class Network(nn.Module):
 
         #.data is used to pull a tensor from a pytorch variable. Deprecated, but it grabs a copy of the data that will not be tracked by gradients
         rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = \
-            anchor_target_layer_torch(self._gt_boxes, self._gt_boxes_dc, self._info, self._feat_stride, self._anchors, self._num_anchors, height, width, self._device)
+            anchor_target_layer_torch(self._gt_boxes, self._gt_boxes_dc, self._info, self._anchors, self._num_anchors, height, width, self._device)
             # bbox_outside_weights
 
         #rpn_labels = torch.from_numpy(rpn_labels).float().to(
@@ -159,17 +162,28 @@ class Network(nn.Module):
         #        self._device)  #.set_shape([1, None, None, self._num_anchors * 4])
 
         rpn_labels = rpn_labels.long()
-        self._anchor_targets['rpn_labels']               = rpn_labels
-        self._anchor_targets['rpn_bbox_targets']         = rpn_bbox_targets
-        self._anchor_targets['rpn_bbox_inside_weights']  = rpn_bbox_inside_weights
-        self._anchor_targets['rpn_bbox_outside_weights'] = rpn_bbox_outside_weights
+        if(cfg.USE_FPN):
+            anchor_target_dict = ['rpn_labels','rpn_bbox_targets','rpn_bbox_inside_weights','rpn_bbox_outside_weights']
+            for anchor_target in anchor_target_dict:
+                if(anchor_target not in self._anchor_targets.keys()):
+                    self._anchor_targets[anchor_target] = []
+            self._anchor_targets['rpn_labels'].append(rpn_labels)
+            self._anchor_targets['rpn_bbox_targets'].append(rpn_bbox_targets)
+            self._anchor_targets['rpn_bbox_inside_weights'].append(rpn_bbox_inside_weights)
+            self._anchor_targets['rpn_bbox_outside_weights'].append(rpn_bbox_outside_weights)
+        else:
+            self._anchor_targets['rpn_labels']               = rpn_labels
+            self._anchor_targets['rpn_bbox_targets']         = rpn_bbox_targets
+            self._anchor_targets['rpn_bbox_inside_weights']  = rpn_bbox_inside_weights
+            self._anchor_targets['rpn_bbox_outside_weights'] = rpn_bbox_outside_weights
 
         for k in self._anchor_targets.keys():
             self._score_summaries[k] = self._anchor_targets[k]
 
     def _proposal_target_layer(self, rois, roi_scores, anchors_3d):
+        num_bbox_elem = cfg[cfg.NET_TYPE.upper()].NUM_BBOX_ELEM
         labels, rois, anchors_3d, roi_scores, bbox_targets, bbox_inside_weights, bbox_outside_weights = \
-            proposal_target_layer(rois, roi_scores, anchors_3d, self._gt_boxes, self._true_gt_boxes, self._gt_boxes_dc, self._num_classes)
+            proposal_target_layer(rois, roi_scores, anchors_3d, self._gt_boxes, self._true_gt_boxes, self._gt_boxes_dc, self._num_classes, num_bbox_elem)
 
         self._proposal_targets['rois']                 = rois
         self._proposal_targets['labels']               = labels.long()
@@ -182,30 +196,28 @@ class Network(nn.Module):
 
         return rois, roi_scores, anchors_3d
 
-    def _anchor_component(self, height, width):
+    def _anchor_component(self, height, width, feat_stride):
         if(self._net_type == 'image'):
+            if(cfg.USE_FPN):
+                anchor_scales = [self._anchor_scales[0] * feat_stride/self._feat_stride]
+            else:
+                anchor_scales = self._anchor_scales
             anchors, anchor_length = generate_anchors_pre(\
                                                 height, width,
-                                                self._feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
+                                                feat_stride, anchor_scales, self._anchor_ratios, self._frame_scale)
             #TODO: Unused, shouldn't use unless lidar. fix please.
             self._anchors_3d = torch.from_numpy(anchors).to(self._device)
         elif(self._net_type == 'lidar'):
             anchor_generator = GridAnchor3dGenerator()
-            anchor_length, anchors = anchor_generator._generate(height, width, self._feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
+            anchor_length, anchors = anchor_generator._generate(height, width, feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
             self._anchors_3d = torch.from_numpy(anchors).to(self._device)
-            anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*self._feat_stride-1, (height)*self._feat_stride-1)
+            anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*feat_stride-1, (height)*feat_stride-1)
         if(cfg.DEBUG.DRAW_ANCHORS or cfg.DEBUG.DRAW_ANCHOR_T):
             self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
         self._anchors = torch.from_numpy(anchors).to(self._device)
         self._anchor_length = anchor_length
 
-    #Determine losses for single batch image
-    def _add_losses(self, sigma_rpn=3.0):
-        # RPN, class loss
-        #View rearranges the matrix to match specified dimension -1 is inferred from other dims, probably OBJ/Not OBJ
-        rpn_cls_score = self._predictions['rpn_cls_score_reshape'].view(-1, 2)
-        #What is the target label out of the RPN
-        rpn_label     = self._anchor_targets['rpn_labels'].view(-1)
+    def _add_rpn_losses(self,sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights):
         #Remove all non zeros to get an index list of target objects, not dontcares
         #.nonzero() returns indices
         rpn_select    = (rpn_label.data != -1).nonzero().view(-1)
@@ -220,13 +232,6 @@ class Network(nn.Module):
         #Compare labels from anchor_target_layer and rpn_layer
         rpn_cross_entropy = F.cross_entropy(rpn_cls_score, rpn_label, reduction='mean')
 
-        # RPN, bbox loss
-
-        #Pretty sure these are delta's at this point
-        rpn_bbox_pred            = self._predictions['rpn_bbox_pred']
-        rpn_bbox_targets         = self._anchor_targets['rpn_bbox_targets']
-        rpn_bbox_inside_weights  = self._anchor_targets['rpn_bbox_inside_weights']
-        rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights']
         rpn_loss_box = loss_utils.smooth_l1_loss(
             'RPN',
             rpn_bbox_pred,
@@ -236,6 +241,47 @@ class Network(nn.Module):
             rpn_bbox_outside_weights,
             sigma=sigma_rpn,
             dim=[1, 2, 3])
+        return rpn_cross_entropy, rpn_loss_box
+
+    #Determine losses for single batch image
+    def _add_losses(self, sigma_rpn=3.0):
+        # RPN, class loss
+        if(cfg.USE_FPN):
+            rpn_cross_entropy = None
+            rpn_loss_box      = None
+            num_fpn_layers = len(self._predictions['rpn_bbox_pred'])
+            for i,_ in enumerate(self._predictions['rpn_bbox_pred']):
+                #View rearranges the matrix to match specified dimension -1 is inferred from other dims, probably OBJ/Not OBJ
+                rpn_cls_score = self._predictions['rpn_cls_score_reshape'][i].view(-1, 2)
+                #What is the target label out of the RPN
+                rpn_label     = self._anchor_targets['rpn_labels'][i].view(-1)
+                #Pretty sure these are delta's at this point
+                rpn_bbox_pred            = self._predictions['rpn_bbox_pred'][i]
+                rpn_bbox_targets         = self._anchor_targets['rpn_bbox_targets'][i]
+                rpn_bbox_inside_weights  = self._anchor_targets['rpn_bbox_inside_weights'][i]
+                rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights'][i]
+                s_rpn_cross_entropy, s_rpn_loss_box = self._add_rpn_losses(sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights)
+                if(rpn_cross_entropy is None):
+                    rpn_cross_entropy = s_rpn_cross_entropy
+                else:
+                    rpn_cross_entropy += s_rpn_cross_entropy
+                if(rpn_loss_box is None):
+                    rpn_loss_box = s_rpn_loss_box
+                else:
+                    rpn_loss_box += s_rpn_loss_box
+            rpn_cross_entropy = rpn_cross_entropy/num_fpn_layers
+            rpn_loss_box      = rpn_loss_box/num_fpn_layers
+        else:
+            #View rearranges the matrix to match specified dimension -1 is inferred from other dims, probably OBJ/Not OBJ
+            rpn_cls_score = self._predictions['rpn_cls_score_reshape'].view(-1, 2)
+            #What is the target label out of the RPN
+            rpn_label     = self._anchor_targets['rpn_labels'].view(-1)
+            #Pretty sure these are delta's at this point
+            rpn_bbox_pred            = self._predictions['rpn_bbox_pred']
+            rpn_bbox_targets         = self._anchor_targets['rpn_bbox_targets']
+            rpn_bbox_inside_weights  = self._anchor_targets['rpn_bbox_inside_weights']
+            rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights']
+            rpn_cross_entropy, rpn_loss_box = self._add_rpn_losses(sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights)
         if(cfg.ENABLE_FULL_NET):
             # RCNN, class loss, performed on class score logits
             cls_score            = self._predictions['cls_score']
@@ -290,8 +336,6 @@ class Network(nn.Module):
         #print('RPN result')
         #print(rpn)
         self._act_summaries['rpn'] = rpn
-        dropout_layer = nn.Dropout(0.1)
-        rpn_d = dropout_layer(rpn)
         rpn_cls_score = self.rpn_cls_score_net(
             rpn)  # batch * (num_anchors * 2) * h * w
         #print(rpn_cls_score.size())
@@ -328,8 +372,6 @@ class Network(nn.Module):
             #N.B. - ROI's passed into proposal_target_layer have been pre-transformed and are true bounding boxes
             #Generate final detection targets from ROI's generated from the RPN
             #self.timers['proposal_t'].tic()
-            if(cfg.ENABLE_FULL_NET):
-                rois, _, anchors_3d = self._proposal_target_layer(rois, roi_scores, anchors_3d)
             #self.timers['proposal_t'].toc()
         else:
             if cfg.TEST.MODE == 'nms':
@@ -338,18 +380,18 @@ class Network(nn.Module):
                 rois, roi_scores, anchors_3d = self._proposal_top_layer(rpn_cls_prob, rpn_bbox_pred)
             else:
                 raise NotImplementedError
-
-        self._predictions['rpn_cls_score'] = rpn_cls_score
-        self._predictions['rpn_cls_score_reshape'] = rpn_cls_score_reshape
-        self._predictions['rpn_cls_prob'] = rpn_cls_prob
-        self._predictions['rpn_cls_pred'] = rpn_cls_pred
-        self._predictions['rpn_bbox_pred'] = rpn_bbox_pred
-        self._predictions['rois'] = rois
-        self._predictions['roi_scores'] = roi_scores
-        self._predictions['anchors_3d'] = anchors_3d
-
-        return rois
-
+        if(self._mode != 'TEST'):
+            if(cfg.USE_FPN):
+                rpn_pred_dict = ['rpn_cls_score_reshape','rpn_bbox_pred']
+                for rpn_pred in rpn_pred_dict:
+                    if(rpn_pred not in self._predictions.keys()):
+                        self._predictions[rpn_pred] = []
+                self._predictions['rpn_cls_score_reshape'].append(rpn_cls_score_reshape)
+                self._predictions['rpn_bbox_pred'].append(rpn_bbox_pred)
+            else:
+                self._predictions['rpn_cls_score_reshape'] = rpn_cls_score_reshape
+                self._predictions['rpn_bbox_pred'] = rpn_bbox_pred
+        return rois, roi_scores, anchors_3d
     #Used to dynamically change batch size depending on eval or train
     def set_e_num_sample(self,e_num_sample):
         self._e_num_sample = e_num_sample
@@ -369,7 +411,10 @@ class Network(nn.Module):
         self._anchor_ratios = anchor_ratios
         self._num_ratios = len(anchor_ratios)
 
-        self._num_anchors = self._num_scales * self._num_ratios
+        if(cfg.USE_FPN == True):
+            self._num_anchors = self._num_ratios
+        else:
+            self._num_anchors = self._num_scales * self._num_ratios
 
         assert tag != None
 
@@ -379,16 +424,16 @@ class Network(nn.Module):
     def _build_resnet(self):
         # choose different blocks for different number of layers
         if self._num_resnet_layers == 50:
-            resnet = custom_resnet.resnet50(dropout_en=self._dropout_en,drop_rate=self._resnet_drop_rate, batchnorm_en=self._batchnorm_en)
+            resnet = custom_resnet.resnet50(dropout_en=False,drop_rate=self._resnet_drop_rate, batchnorm_en=self._batchnorm_en)
 
         elif self._num_resnet_layers == 34:
-            resnet = custom_resnet.resnet34(dropout_en=self._dropout_en,drop_rate=self._resnet_drop_rate, batchnorm_en=self._batchnorm_en)
+            resnet = custom_resnet.resnet34(dropout_en=False,drop_rate=self._resnet_drop_rate, batchnorm_en=self._batchnorm_en)
             
         elif self._num_resnet_layers == 101:
-            resnet = custom_resnet.resnet101(dropout_en=self._dropout_en,drop_rate=self._resnet_drop_rate, batchnorm_en=self._batchnorm_en)
+            resnet = custom_resnet.resnet101(dropout_en=False,drop_rate=self._resnet_drop_rate, batchnorm_en=self._batchnorm_en)
 
         elif self._num_resnet_layers == 152:
-            resnet = custom_resnet.resnet152(dropout_en=self._dropout_en,drop_rate=self._resnet_drop_rate, batchnorm_en=self._batchnorm_en)
+            resnet = custom_resnet.resnet152(dropout_en=False,drop_rate=self._resnet_drop_rate, batchnorm_en=self._batchnorm_en)
 
         else:
             # other numbers are not supported
@@ -408,9 +453,10 @@ class Network(nn.Module):
         self.rpn_bbox_pred_net = nn.Conv2d(cfg.RPN_CHANNELS,
                                            self._num_anchors * 4, [1, 1])
         if(cfg.ENABLE_CUSTOM_TAIL):
-            self.t_fc1           = nn.Linear(self._roi_pooling_channels,self._fc7_channels*8)
-            self.t_fc2           = nn.Linear(self._fc7_channels*8,self._fc7_channels*4)
-            self.t_fc3           = nn.Linear(self._fc7_channels*4,self._fc7_channels*2)
+            self.t_fc1           = nn.Linear(self._roi_pooling_channels,self._fc7_channels*4)
+            self.t_fc2           = nn.Linear(self._fc7_channels*4,self._fc7_channels*2)
+            self.t_fc3           = nn.Linear(self._fc7_channels*2,self._fc7_channels)
+            self.t_relu          = nn.ReLU(inplace=True)
 
         #Epistemic dropout layers
         if(cfg.UC.EN_BBOX_EPISTEMIC):
@@ -454,6 +500,11 @@ class Network(nn.Module):
         return RoIAlign((cfg.POOLING_SIZE, cfg.POOLING_SIZE), 1.0 / float(self._feat_stride),
                         0)(bottom, rois)
 
+    def _multiscale_roi_align_layer(self, bottom, rois):
+        img_size = [(bottom['p2'].shape[2]*self._feat_stride, bottom['p2'].shape[3]*self._feat_stride)]
+        rois = [rois[:,1:5]]
+        return torchpooler.MultiScaleRoIAlign(['p2','p3','p4','p5'], (cfg.POOLING_SIZE, cfg.POOLING_SIZE), sampling_ratio=0)(bottom, rois, img_size)
+
     def _crop_pool_layer(self, bottom, rois):
         return Network._crop_pool_layer(self, bottom, rois,
                                         cfg.RESNET.MAX_POOL)
@@ -464,9 +515,16 @@ class Network(nn.Module):
             c2 = self._layers['layer1'](c1)
             c3 = self._layers['layer2'](c2)
             c4 = self._layers['layer3'](c3)
-            net_conv = self._layers['fpn'](c2, c3, c4)
-            if(cfg.NET_TYPE == 'image'):
-                net_conv = self._layers['fpn_downsample'](net_conv)
+            c5 = self._layers['layer4'](c4)
+            p2, p3, p4, p5 = self._layers['fpn'](c2, c3, c4, c5)
+            if(cfg.POOLING_MODE == 'multiscale'):
+                net_conv = OrderedDict()
+                net_conv['p2'] = p2
+                net_conv['p3'] = p3
+                net_conv['p4'] = p4
+                net_conv['p5'] = p5
+            else:
+                net_conv = p2
         else:   
             net_conv = self._layers['head'](frame)
 
@@ -573,7 +631,8 @@ class Network(nn.Module):
         return out
 
     def _custom_tail(self,pool5,dropout_en):
-        pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._e_num_sample,1,1)
+        pool5 = pool5.view(pool5.shape[0],-1).unsqueeze(0).repeat(self._e_num_sample,1,1)
+        #pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._e_num_sample,1,1)
         if(dropout_en):
             conv_dropout_rate = 0.2
             fc_dropout_rate   = 0.5
@@ -586,17 +645,20 @@ class Network(nn.Module):
         fc_dropout3   = nn.Dropout(fc_dropout_rate)
         fc_dropout4   = nn.Dropout(fc_dropout_rate)
         fc_relu      = nn.ReLU(inplace=True)
-        pool5_d = pool_dropout(pool5)
-        fc1     = self.t_fc1(pool5_d)
-        fc1_r   = fc_relu(fc1)
-        fc1_d   = fc_dropout1(fc1_r)
-        fc2     = self.t_fc2(fc1_d)
-        fc2_r   = fc_relu(fc2)
-        fc2_d   = fc_dropout2(fc2_r)
-        fc3     = self.t_fc3(fc2_d)
-        fc3_r   = fc_relu(fc3)
-        fc3_d   = fc_dropout3(fc3_r)
-        return fc3_d
+        #x   = pool_dropout(pool5)
+        x   = self.t_fc1(pool5)
+        x   = self.t_relu(x)
+        if(dropout_en):
+            x   = fc_dropout1(x)
+        x   = self.t_fc2(x)
+        x   = self.t_relu(x)
+        if(dropout_en):
+            x   = fc_dropout2(x)
+        x   = self.t_fc3(x)
+        x   = self.t_relu(x)
+        if(dropout_en):
+            x   = fc_dropout3(x)
+        return x
 
     def _run_summary_op(self, val=False, summary_size=1):
         """
@@ -660,18 +722,52 @@ class Network(nn.Module):
         #print(net_conv)
         # build the anchors for the image
         #self.timers['anchor_gen'].tic()
-        self._anchor_component(net_conv.size(2), net_conv.size(3))
-        #self.timers['anchor_gen'].toc()
-        #print('run region proposal network')
-        #numpy_out = net_conv.cpu().detach().numpy()[0, :, :, :]
-        #print(numpy_out.shape)
-        #for i in range(0,1000):
-        #    numpy.savetxt('/home/mat/Thesis/train_net_conv_out_feature_{:d}_.txt'.format(i), numpy_out[i,:,:], delimiter=',')
-        rois = self._region_proposal(net_conv)
-        #print('_predict ROIs')
-        #print(rois)
+        #if(cfg.POOLING_MODE == 'multiscale' and cfg.USE_FPN):
+        #    #TODO: P2 must be downsampled for fewer anchors
+        #    #Not sure if can just copy here. I think I can. 
+        #    if(self._feat_stride/self._feat_stride == 2):
+        #        p2_c = net_conv['p2'].clone()
+        #        p2 = self._layers['fpn_downsample'](p2_c)
+        #    elif(self._feat_stride/self._feat_stride == 1):
+        #        p2 = net_conv['p2']
+        #    else:
+        #        print('Error in predict network.py')
+        #else:
+        #    p2 = net_conv
+        if(cfg.USE_FPN):
+            rois = []
+            roi_scores = []
+            anchor_3d  = []
+            feat_stride = self._feat_stride
+            rois       = None
+            roi_scores = None
+            anchors_3d = None
+            #Run RPN for each feature level
+            for k, v in net_conv.items():
+                self._anchor_component(v.size(2), v.size(3), feat_stride)
+                s_rois, s_roi_scores, s_anchors_3d = self._region_proposal(v)
+                feat_stride = feat_stride * 2
+                if(rois is None):
+                    rois = s_rois
+                else:
+                    rois = torch.cat((rois,s_rois),dim=0)
+                if(roi_scores is None):
+                    roi_scores = s_roi_scores
+                else:
+                    roi_scores = torch.cat((roi_scores,s_roi_scores),dim=0)
+                if(anchors_3d is None):
+                    anchors_3d = s_anchors_3d
+                else:
+                    anchors_3d = torch.cat((anchors_3d,s_anchors_3d),dim=0)
+        else:
+            self._anchor_component(net_conv.size(2), net_conv.size(3), self._feat_stride)
+            rois, roi_scores, anchors_3d = self._region_proposal(net_conv)
         if(cfg.ENABLE_FULL_NET):
-            if cfg.POOLING_MODE == 'align':
+            if self._mode == 'TRAIN':
+                rois, _, anchors_3d = self._proposal_target_layer(rois, roi_scores, anchors_3d)
+            if cfg.POOLING_MODE == 'multiscale':
+                pool5 = self._multiscale_roi_align_layer(net_conv, rois)
+            elif cfg.POOLING_MODE == 'align':
                 pool5 = self._roi_align_layer(net_conv, rois)
             else:
                 pool5 = self._roi_pool_layer(net_conv, rois)
@@ -694,6 +790,9 @@ class Network(nn.Module):
 
             self._region_classification(fc7)
             #self.timers['net'].toc()
+        self._predictions['rois']       = rois
+        self._predictions['roi_scores'] = roi_scores
+        self._predictions['anchors_3d'] = anchors_3d
         for k in self._predictions.keys():
             self._score_summaries[k] = self._predictions[k]
 
