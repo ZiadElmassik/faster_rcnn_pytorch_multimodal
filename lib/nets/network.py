@@ -61,6 +61,7 @@ class Network(nn.Module):
         self._frame_scale      = 1.0
         self._proposal_cnt     = 0
         self._anchors          = None
+        self._anchors_cache    = None
         self._device           = 'cuda'
         self._net_type                        = cfg.NET_TYPE
         self._bbox_means = torch.tensor(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).to(device=self._device)
@@ -84,6 +85,10 @@ class Network(nn.Module):
         self._gt_boxes      = None
         self._true_gt_boxes = None
         self._gt_boxes_dc   = None
+        if(cfg.UC.EN_BBOX_EPISTEMIC or cfg.UC.EN_CLS_EPISTEMIC):
+            self._dropout_en = True
+        else:
+            self._dropout_en = False
 
     def _add_gt_image(self):
         # add back mean
@@ -162,20 +167,14 @@ class Network(nn.Module):
         #        self._device)  #.set_shape([1, None, None, self._num_anchors * 4])
 
         rpn_labels = rpn_labels.long()
-        if(cfg.USE_FPN):
-            anchor_target_dict = ['rpn_labels','rpn_bbox_targets','rpn_bbox_inside_weights','rpn_bbox_outside_weights']
-            for anchor_target in anchor_target_dict:
-                if(anchor_target not in self._anchor_targets.keys()):
-                    self._anchor_targets[anchor_target] = []
-            self._anchor_targets['rpn_labels'].append(rpn_labels)
-            self._anchor_targets['rpn_bbox_targets'].append(rpn_bbox_targets)
-            self._anchor_targets['rpn_bbox_inside_weights'].append(rpn_bbox_inside_weights)
-            self._anchor_targets['rpn_bbox_outside_weights'].append(rpn_bbox_outside_weights)
-        else:
-            self._anchor_targets['rpn_labels']               = rpn_labels
-            self._anchor_targets['rpn_bbox_targets']         = rpn_bbox_targets
-            self._anchor_targets['rpn_bbox_inside_weights']  = rpn_bbox_inside_weights
-            self._anchor_targets['rpn_bbox_outside_weights'] = rpn_bbox_outside_weights
+        anchor_target_dict = ['rpn_labels','rpn_bbox_targets','rpn_bbox_inside_weights','rpn_bbox_outside_weights']
+        for anchor_target in anchor_target_dict:
+            if(anchor_target not in self._anchor_targets.keys()):
+                self._anchor_targets[anchor_target] = []
+        self._anchor_targets['rpn_labels'].append(rpn_labels)
+        self._anchor_targets['rpn_bbox_targets'].append(rpn_bbox_targets)
+        self._anchor_targets['rpn_bbox_inside_weights'].append(rpn_bbox_inside_weights)
+        self._anchor_targets['rpn_bbox_outside_weights'].append(rpn_bbox_outside_weights)
 
         for k in self._anchor_targets.keys():
             self._score_summaries[k] = self._anchor_targets[k]
@@ -197,25 +196,30 @@ class Network(nn.Module):
         return rois, roi_scores, anchors_3d
 
     def _anchor_component(self, height, width, feat_stride):
-        if(self._net_type == 'image'):
-            if(cfg.USE_FPN):
-                anchor_scales = [self._anchor_scales[0] * feat_stride/self._feat_stride]
-            else:
-                anchor_scales = self._anchor_scales
-            anchors, anchor_length = generate_anchors_pre(\
-                                                height, width,
-                                                feat_stride, anchor_scales, self._anchor_ratios, self._frame_scale)
-            #TODO: Unused, shouldn't use unless lidar. fix please.
-            self._anchors_3d = torch.from_numpy(anchors).to(self._device)
-        elif(self._net_type == 'lidar'):
-            anchor_generator = GridAnchor3dGenerator()
-            anchor_length, anchors = anchor_generator._generate(height, width, feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
-            self._anchors_3d = torch.from_numpy(anchors).to(self._device)
-            anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*feat_stride-1, (height)*feat_stride-1)
+        if(self._anchors_cache is None):
+            self._anchors_cache = {}
+        if(feat_stride not in self._anchors_cache.items()):
+            if(self._net_type == 'image'):
+                if(cfg.USE_FPN):
+                    anchor_scales = [self._anchor_scales[0] * feat_stride/self._feat_stride]
+                else:
+                    anchor_scales = self._anchor_scales
+                anchors, anchor_length = generate_anchors_pre(\
+                                                    height, width,
+                                                    feat_stride, anchor_scales, self._anchor_ratios, self._frame_scale)
+                #TODO: Unused, shouldn't use unless lidar. fix please.
+                self._anchors_3d = torch.from_numpy(anchors).to(self._device)
+            elif(self._net_type == 'lidar'):
+                anchor_generator = GridAnchor3dGenerator()
+                anchor_length, anchors = anchor_generator._generate(height, width, feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
+                self._anchors_3d = torch.from_numpy(anchors).to(self._device)
+                anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*feat_stride-1, (height)*feat_stride-1)
+            self._anchors_cache[feat_stride] = torch.from_numpy(anchors).to(self._device)
+            #self._anchors = torch.from_numpy(anchors).to(self._device)
+        self._anchors       = self._anchors_cache[feat_stride]
+        self._anchor_length = len(self._anchors_cache[feat_stride])
         if(cfg.DEBUG.DRAW_ANCHORS or cfg.DEBUG.DRAW_ANCHOR_T):
-            self._anchor_targets['anchors'] = torch.from_numpy(anchors).to(self._device)
-        self._anchors = torch.from_numpy(anchors).to(self._device)
-        self._anchor_length = anchor_length
+            self._anchor_targets['anchors'] = self._anchors
 
     def _add_rpn_losses(self,sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights):
         #Remove all non zeros to get an index list of target objects, not dontcares
@@ -246,42 +250,32 @@ class Network(nn.Module):
     #Determine losses for single batch image
     def _add_losses(self, sigma_rpn=3.0):
         # RPN, class loss
-        if(cfg.USE_FPN):
-            rpn_cross_entropy = None
-            rpn_loss_box      = None
-            num_fpn_layers = len(self._predictions['rpn_bbox_pred'])
-            for i,_ in enumerate(self._predictions['rpn_bbox_pred']):
-                #View rearranges the matrix to match specified dimension -1 is inferred from other dims, probably OBJ/Not OBJ
-                rpn_cls_score = self._predictions['rpn_cls_score_reshape'][i].view(-1, 2)
-                #What is the target label out of the RPN
-                rpn_label     = self._anchor_targets['rpn_labels'][i].view(-1)
-                #Pretty sure these are delta's at this point
-                rpn_bbox_pred            = self._predictions['rpn_bbox_pred'][i]
-                rpn_bbox_targets         = self._anchor_targets['rpn_bbox_targets'][i]
-                rpn_bbox_inside_weights  = self._anchor_targets['rpn_bbox_inside_weights'][i]
-                rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights'][i]
-                s_rpn_cross_entropy, s_rpn_loss_box = self._add_rpn_losses(sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights)
-                if(rpn_cross_entropy is None):
-                    rpn_cross_entropy = s_rpn_cross_entropy
-                else:
-                    rpn_cross_entropy += s_rpn_cross_entropy
-                if(rpn_loss_box is None):
-                    rpn_loss_box = s_rpn_loss_box
-                else:
-                    rpn_loss_box += s_rpn_loss_box
-            rpn_cross_entropy = rpn_cross_entropy/num_fpn_layers
-            rpn_loss_box      = rpn_loss_box/num_fpn_layers
-        else:
+        rpn_cross_entropy = None
+        rpn_loss_box      = None
+        num_fpn_layers = len(self._predictions['rpn_bbox_pred'])
+        for i,_ in enumerate(self._predictions['rpn_bbox_pred']):
             #View rearranges the matrix to match specified dimension -1 is inferred from other dims, probably OBJ/Not OBJ
-            rpn_cls_score = self._predictions['rpn_cls_score_reshape'].view(-1, 2)
+            rpn_cls_score = self._predictions['rpn_cls_score_reshape'][i].view(-1, 2)
             #What is the target label out of the RPN
-            rpn_label     = self._anchor_targets['rpn_labels'].view(-1)
+            rpn_label     = self._anchor_targets['rpn_labels'][i].view(-1)
             #Pretty sure these are delta's at this point
-            rpn_bbox_pred            = self._predictions['rpn_bbox_pred']
-            rpn_bbox_targets         = self._anchor_targets['rpn_bbox_targets']
-            rpn_bbox_inside_weights  = self._anchor_targets['rpn_bbox_inside_weights']
-            rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights']
-            rpn_cross_entropy, rpn_loss_box = self._add_rpn_losses(sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights)
+            rpn_bbox_pred            = self._predictions['rpn_bbox_pred'][i]
+            rpn_bbox_targets         = self._anchor_targets['rpn_bbox_targets'][i]
+            rpn_bbox_inside_weights  = self._anchor_targets['rpn_bbox_inside_weights'][i]
+            rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights'][i]
+            s_rpn_cross_entropy, s_rpn_loss_box = self._add_rpn_losses(sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights)
+            if(rpn_cross_entropy is None):
+                rpn_cross_entropy = s_rpn_cross_entropy
+            else:
+                rpn_cross_entropy += s_rpn_cross_entropy
+            if(rpn_loss_box is None):
+                rpn_loss_box = s_rpn_loss_box
+            else:
+                rpn_loss_box += s_rpn_loss_box
+        if(not cfg.USE_FPN):
+            assert num_fpn_layers == 1
+        rpn_cross_entropy = rpn_cross_entropy/num_fpn_layers
+        rpn_loss_box      = rpn_loss_box/num_fpn_layers
         if(cfg.ENABLE_FULL_NET):
             # RCNN, class loss, performed on class score logits
             cls_score            = self._predictions['cls_score']
@@ -411,7 +405,7 @@ class Network(nn.Module):
         self._anchor_ratios = anchor_ratios
         self._num_ratios = len(anchor_ratios)
 
-        if(cfg.USE_FPN == True):
+        if(cfg.USE_FPN):
             self._num_anchors = self._num_ratios
         else:
             self._num_anchors = self._num_scales * self._num_ratios
@@ -531,7 +525,7 @@ class Network(nn.Module):
         self._act_summaries['conv'] = net_conv
         return net_conv
 
-    def _head_to_tail(self, pool5, dropout_en):
+    def _head_to_tail(self, pool5):
         #pool5 = pool5.unsqueeze(0).repeat(self._e_num_sample,1,1,1,1)
         #pool5 = pool5.view(-1,pool5.shape[2],pool5.shape[3],pool5.shape[4])
         #Reshape due to limitation on nn.conv2d (only one dim can be batch)
@@ -589,51 +583,42 @@ class Network(nn.Module):
 
     def _cls_tail(self,fc7):
         fc7_reshape = fc7.view(-1,fc7.shape[2])
-        #fc_dropout_rate   = 0.5
-        #fc_dropout1   = nn.Dropout(fc_dropout_rate)
-        #fc_dropout2   = nn.Dropout(fc_dropout_rate)
-        #fc_dropout3   = nn.Dropout(fc_dropout_rate)
         fc_relu      = nn.ReLU(inplace=True)
-        out  = self.cls_drop1(fc7_reshape)
+        if(self._dropout_en):
+            out  = self.cls_drop1(fc7_reshape)
         out  = self.cls_fc1(out)
         out  = self.cls_bn1(out)
         out  = fc_relu(out)
-        out  = self.cls_drop1(out)
+        if(self._dropout_en):
+            out  = self.cls_drop1(out)
         out  = self.cls_fc2(out)
         out  = self.cls_bn2(out)
         out  = fc_relu(out)
-        out  = self.cls_drop2(out)
-        #out   = self.cls_fc3(out)
-        #out   = fc_relu(out)
-        #out   = fc_dropout2(out)
+        if(self._dropout_en):
+            out  = self.cls_drop2(out)
         out = out.view(fc7.shape[0],fc7.shape[1],-1)
         return out
 
     def _bbox_tail(self,fc7):
         fc7_reshape = fc7.view(-1,fc7.shape[2])
-        #fc_dropout_rate   = 0.4
-        #fc_dropout1   = nn.Dropout(fc_dropout_rate)
-        #fc_dropout2   = nn.Dropout(fc_dropout_rate)
-        #fc_dropout3   = nn.Dropout(fc_dropout_rate)
         fc_relu      = nn.ReLU(inplace=True)
         out     = self.bbox_fc1(fc7_reshape)
         out   = self.bbox_bn1(out)
         out   = fc_relu(out)
-        out   = self.bbox_drop1(out)
+        if(self._dropout_en):
+            out   = self.bbox_drop1(out)
         out   = self.bbox_fc2(out)
         out   = self.bbox_bn2(out)
         out   = fc_relu(out)
-        out   = self.bbox_drop2(out)
-        #fc3     = self.bbox_fc3(fc2_d)
-        #fc3_r   = fc_relu(fc3)
-        #fc3_d   = fc_dropout2(fc3_r)
+        if(self._dropout_en):
+            out   = self.bbox_drop2(out)
         out = out.view(fc7.shape[0],fc7.shape[1],-1)
         return out
 
-    def _custom_tail(self,pool5,dropout_en):
+    def _custom_tail(self,pool5):
         pool5 = pool5.view(pool5.shape[0],-1).unsqueeze(0).repeat(self._e_num_sample,1,1)
         #pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._e_num_sample,1,1)
-        if(dropout_en):
+        if(self._dropout_en):
             conv_dropout_rate = 0.2
             fc_dropout_rate   = 0.5
         else:
@@ -645,18 +630,17 @@ class Network(nn.Module):
         fc_dropout3   = nn.Dropout(fc_dropout_rate)
         fc_dropout4   = nn.Dropout(fc_dropout_rate)
         fc_relu      = nn.ReLU(inplace=True)
-        #x   = pool_dropout(pool5)
         x   = self.t_fc1(pool5)
         x   = self.t_relu(x)
-        if(dropout_en):
+        if(self._dropout_en):
             x   = fc_dropout1(x)
         x   = self.t_fc2(x)
         x   = self.t_relu(x)
-        if(dropout_en):
+        if(self._dropout_en):
             x   = fc_dropout2(x)
         x   = self.t_fc3(x)
         x   = self.t_relu(x)
-        if(dropout_en):
+        if(self._dropout_en):
             x   = fc_dropout3(x)
         return x
 
@@ -719,21 +703,7 @@ class Network(nn.Module):
         #self.timers['net'].tic()
         torch.backends.cudnn.benchmark = False
         net_conv = self._input_to_head(self._frame)
-        #print(net_conv)
-        # build the anchors for the image
         #self.timers['anchor_gen'].tic()
-        #if(cfg.POOLING_MODE == 'multiscale' and cfg.USE_FPN):
-        #    #TODO: P2 must be downsampled for fewer anchors
-        #    #Not sure if can just copy here. I think I can. 
-        #    if(self._feat_stride/self._feat_stride == 2):
-        #        p2_c = net_conv['p2'].clone()
-        #        p2 = self._layers['fpn_downsample'](p2_c)
-        #    elif(self._feat_stride/self._feat_stride == 1):
-        #        p2 = net_conv['p2']
-        #    else:
-        #        print('Error in predict network.py')
-        #else:
-        #    p2 = net_conv
         if(cfg.USE_FPN):
             rois = []
             roi_scores = []
@@ -773,19 +743,11 @@ class Network(nn.Module):
                 pool5 = self._roi_pool_layer(net_conv, rois)
             #del net_conv
             if self._mode == 'TRAIN':
-                #Find best algo
-                #self._e_num_sample = 1
                 torch.backends.cudnn.benchmark = True  # benchmark because now the input size are fixed
-            #elif(self._mode == 'TEST'):
-            #    self._e_num_sample = 10
-            if(cfg.UC.EN_BBOX_EPISTEMIC or cfg.UC.EN_CLS_EPISTEMIC):
-                dropout_en = True
-            else:
-                dropout_en = False
             if(cfg.ENABLE_CUSTOM_TAIL):
-                fc7 = self._custom_tail(pool5,dropout_en)
+                fc7 = self._custom_tail(pool5)
             else:
-                fc7 = self._head_to_tail(pool5,dropout_en)
+                fc7 = self._head_to_tail(pool5)
                 fc7 = fc7.unsqueeze(0).repeat(self._e_num_sample,1,1)
 
             self._region_classification(fc7)
@@ -840,21 +802,25 @@ class Network(nn.Module):
         self._predict()
         #ENABLE to draw all anchors
         if(cfg.DEBUG.DRAW_ANCHORS):
-            self._draw_and_save_anchors(frame,
-                                        self._anchor_targets['anchors'],
-                                        self._net_type)
-
+            if(cfg.USE_FPN):
+                for i,(k,v) in enumerate(self._anchors_cache.items()):
+                    self._draw_and_save_anchors(frame,
+                                                v,
+                                                self._net_type,
+                                                k)
         #ENABLE to draw all anchor targets
         if(cfg.DEBUG.DRAW_ANCHOR_T):
-            self._draw_and_save_targets(frame,
-                                        self._anchor_targets['rpn_bbox_targets'],
-                                        self._anchor_targets['anchors'],
-                                        None,
-                                        self._anchor_targets['rpn_labels'],
-                                        self._anchor_targets['rpn_bbox_inside_weights'],
-                                        'anchor',
-                                        self._net_type)
-
+            if(cfg.USE_FPN):
+                for i,(k,v) in enumerate(self._anchors_cache.items()):
+                    self._draw_and_save_targets(frame,
+                                                self._anchor_targets['rpn_bbox_targets'][i],
+                                                v,
+                                                None,
+                                                self._anchor_targets['rpn_labels'][i],
+                                                self._anchor_targets['rpn_bbox_inside_weights'][i],
+                                                'anchor',
+                                                self._net_type,
+                                                k)
         #ENABLE to draw all proposal targets
         if(cfg.DEBUG.DRAW_PROPOSAL_T):
             self._draw_and_save_targets(frame,
@@ -864,7 +830,8 @@ class Network(nn.Module):
                                         self._proposal_targets['labels'],
                                         self._proposal_targets['bbox_inside_weights'],
                                         'proposal',
-                                        self._net_type)
+                                        self._net_type,
+                                        0)
 
         if(mode == 'VAL' or mode == 'TRAIN'):
             #self.timers['losses'].tic()
@@ -997,24 +964,22 @@ class Network(nn.Module):
             a_cls_entropy                      = loss_utils.categorical_entropy(cls_prob)
             distorted_cls_score                = loss_utils.logit_distort(cls_score,cls_var,cfg.UC.A_NUM_CE_SAMPLE)
             a_cls_mutual_info                  = loss_utils.categorical_mutual_information(distorted_cls_score)
-            uncertainties['a_entropy']     = a_cls_entropy.data.detach()
-            uncertainties['a_mutual_info'] = a_cls_mutual_info
+            uncertainties['a_entropy']         = a_cls_entropy.data.detach()
+            uncertainties['a_mutual_info']     = a_cls_mutual_info
             uncertainties['a_cls_var']         = cls_var
 
         #For tensorboard
         if(cfg.UC.EN_CLS_EPISTEMIC):
-            e_cls_score = self._mc_run_output['cls_score'].detach()
-            e_cls_prob  = self._mc_run_output['cls_prob'].detach()
+            e_cls_score     = self._mc_run_output['cls_score'].detach()
+            e_cls_prob      = self._mc_run_output['cls_prob'].detach()
             e_cls_prob_mean = torch.mean(e_cls_prob,dim=0)
             #Compute average entropy via mutual information
-            e_cls_entropy     = loss_utils.categorical_entropy(e_cls_prob_mean)
-            e_cls_mutual_info = loss_utils.categorical_mutual_information(e_cls_score)
-            self._mc_run_results['e_mutual_info'] = torch.mean(e_cls_mutual_info)
-            self._mc_run_results['e_entropy']     = torch.mean(e_cls_entropy)
+            e_cls_entropy                             = loss_utils.categorical_entropy(e_cls_prob_mean)
+            e_cls_mutual_info                         = loss_utils.categorical_mutual_information(e_cls_score)
+            self._mc_run_results['e_mutual_info']     = torch.mean(e_cls_mutual_info)
+            self._mc_run_results['e_entropy']         = torch.mean(e_cls_entropy)
             uncertainties['e_entropy']                = e_cls_entropy
             uncertainties['e_mutual_info']            = e_cls_mutual_info
-        #else:
-        #    uncertainties['e_mutual_info'] = torch.tensor([0])
 
         if(cfg.UC.EN_BBOX_ALEATORIC):
             #Grab after bbox are transformed into pc space and MC sampling occurs
@@ -1028,17 +993,10 @@ class Network(nn.Module):
             #TODO: add mean and std deviation
             mc_bbox_pred = self._mc_run_output['bbox_pred']
             mc_bbox_pred = mc_bbox_pred.view(-1,mc_bbox_pred.shape[2])
-            #if(self._mc_bbox_stds is None):
-            #    self._mc_bbox_stds = mc_bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_STDS).repeat(
-            #        self._num_classes).unsqueeze(0).expand_as(mc_bbox_pred)
-            #if(self._mc_bbox_means is None):
-            #    self._mc_bbox_means = mc_bbox_pred.data.new(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).repeat(
-            #        self._num_classes).unsqueeze(0).expand_as(mc_bbox_pred)
-            #mc_bbox_pred = mc_bbox_pred.mul(self._mc_bbox_stds).add(self._mc_bbox_means)
             mc_bbox_pred = mc_bbox_pred.mul(self._bbox_stds.repeat(self._num_classes)).add(self._bbox_means.repeat(self._num_classes))
-            roi_sampled = rois[:,1:]
-            roi_sampled = roi_sampled.unsqueeze(0).repeat(self._e_num_sample,1,1)
-            roi_sampled = roi_sampled.view(-1,roi_sampled.shape[2])
+            roi_sampled  = rois[:,1:]
+            roi_sampled  = roi_sampled.unsqueeze(0).repeat(self._e_num_sample,1,1)
+            roi_sampled  = roi_sampled.view(-1,roi_sampled.shape[2])
 
 
             if(cfg.NET_TYPE == 'image'):
@@ -1052,11 +1010,10 @@ class Network(nn.Module):
             #mc_bbox_covar = loss_utils.compute_bbox_cov(mc_bbox_pred)
             #Way #2 to compute bbox var
             e_bbox_var   = loss_utils.compute_bbox_var(mc_bbox_pred)
-            #Way #3 to compute bbox var
-            #Doesnt work??
+            #Way #3 to compute bbox var (Doesnt work??)
             #e_bbox_var = torch.var(mc_bbox_pred,dim=0)
-            uncertainties['e_bbox_var'] = e_bbox_var
-            self._mc_run_output['e_bbox_var'] = e_bbox_var
+            uncertainties['e_bbox_var']        = e_bbox_var
+            self._mc_run_output['e_bbox_var']  = e_bbox_var
             self._mc_run_results['e_bbox_var'] = torch.mean(e_bbox_var)
             #Compute average variance
         #else:
@@ -1066,7 +1023,7 @@ class Network(nn.Module):
                 if(k in self._val_event_summaries):
                     self._val_event_summaries[k] += self._mc_run_results[k].item()
                 else:
-                    self._val_event_summaries[k] = self._mc_run_results[k].item()
+                    self._val_event_summaries[k]  = self._mc_run_results[k].item()
         return uncertainties
 
     def train_step(self, blobs, train_op, update_weights=False):
@@ -1085,7 +1042,7 @@ class Network(nn.Module):
             else:
                 self._cum_losses[key] = self._losses[key].item()
 
-        self._batch_gt_entries                += len(blobs['gt_boxes'])
+        self._batch_gt_entries        += len(blobs['gt_boxes'])
         #Pseudo batching, only one image on the GPU at a time, but weights are updated at intervals
 
         if(update_weights):
@@ -1158,24 +1115,25 @@ class Network(nn.Module):
     -------
     draws png files to a specific subfolder, dictated by cfg.DATA_DIR
     """
-    def _draw_and_save_targets(self,frame,targets,rois,anchors_3d,labels,mask,target_type,net_type):
+    def _draw_and_save_targets(self,frame,targets,rois,anchors_3d,labels,mask,target_type,net_type,fpn_cnt):
         datapath = os.path.join(cfg.ROOT_DIR,'debug')
         if not os.path.isdir(datapath):
             os.mkdir(datapath)
         if(target_type == 'anchor'):
            cnt = self._anchor_cnt
+           self._anchor_cnt += 1 
+           out_file = os.path.join(datapath,'{}_{}_target_{}_stride_{}.png'.format(cnt,target_type,net_type,fpn_cnt))
         elif(target_type == 'proposal'):
            cnt = self._proposal_cnt
-        out_file = os.path.join(datapath,'{}_{}_target_{}.png'.format(cnt,target_type,net_type))
+           self._proposal_cnt += 1
+           out_file = os.path.join(datapath,'{}_{}_target_{}.png'.format(cnt,target_type,net_type))
+        else:
+            print('Error in draw_and_save_targets (network.py)')
         if(net_type == 'lidar'):
             self._draw_and_save_lidar_targets(frame,targets,rois,anchors_3d,labels,mask,target_type,out_file)
         elif(net_type == 'image'):
             self._draw_and_save_image_targets(frame,targets,rois,labels,mask,target_type,out_file)
         print('Saving target file at location {}'.format(out_file))  
-        if(target_type == 'anchor'):
-            self._anchor_cnt += 1 
-        elif(target_type == 'proposal'):
-            self._proposal_cnt += 1
 
     def _draw_and_save_lidar_targets(self,frame,targets,rois,anchors_3d,labels,mask,target_type,out_file):
         voxel_grid = frame[0]
@@ -1205,23 +1163,14 @@ class Network(nn.Module):
             mask = torch.where(labels == 0, mask[:,0:7], mask[:,7:14])
             sel_targets = sel_targets*mask
             rois = rois[:,1:5]
-            rois    = rois.data.cpu().numpy()
             #Extract XC,YC and L,W
             targets = sel_targets
-            #stds = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_STDS).unsqueeze(0).expand_as(targets)
-            #means = targets.data.new(cfg.TRAIN.LIDAR.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
             targets = targets.mul(self._bbox_stds).add(self._bbox_means)
             targets = targets.view(-1,7)
             anchors = lidar_3d_bbox_transform_inv(rois,anchors_3d,targets)
             anchors = anchors.data.cpu().numpy()
             anchors = bbox_utils.bbaa_graphics_gems(anchors,voxel_grid_rgb.shape[1],voxel_grid_rgb.shape[0])
-            #rois = anchors
-        #label_mask = labels + 1
-        #label_idx  = label_mask.nonzero().squeeze(1).data.cpu().numpy()
-        #anchors_filtered = anchors[label_idx,:].reshape(-1,4)
-        #else:
-        #    anchors = bbox_3d_transform_inv_all_boxes(anchors_3d,targets)
-            #anchors = 3d_to_bev(anchors)
+            rois    = rois.data.cpu().numpy()
         for i, bbox in enumerate(anchors):
             bbox_mask = mask[i]
             bbox_label = int(labels[i])
@@ -1265,8 +1214,6 @@ class Network(nn.Module):
             rois = rois[:,1:5]
             #Extract XC,YC and L,W
             targets = sel_targets
-            #stds = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_STDS).unsqueeze(0).expand_as(targets)
-            #means = targets.data.new(cfg.TRAIN.IMAGE.BBOX_NORMALIZE_MEANS).unsqueeze(0).expand_as(targets)
             targets = targets.mul(self._bbox_stds).add(self._bbox_means)
         rois = rois.view(-1,4)
         labels = labels.reshape(-1)
@@ -1275,16 +1222,12 @@ class Network(nn.Module):
         label_mask = labels + 1
         label_idx  = label_mask.nonzero().squeeze(1)
         anchors_filtered = anchors[label_idx,:]
-        #else:
-        #    anchors = bbox_3d_transform_inv_all_boxes(anchors_3d,targets)
-            #anchors = 3d_to_bev(anchors)
         for idx in label_idx:
             bbox       = anchors[idx]
             bbox_mask  = mask[idx]
             bbox_label = int(labels[idx])
             roi        = rois[idx]
             np_bbox = None
-            #if(torch.mean(bbox_mask) > 0):
             if(bbox_label >= 1):
                 np_bbox = bbox.data.cpu().numpy()
                 draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
@@ -1315,11 +1258,11 @@ class Network(nn.Module):
     -------
     draws png files to a specific subfolder, dictated by cfg.DATA_DIR
     """
-    def _draw_and_save_anchors(self, frame, anchors, net_type):
+    def _draw_and_save_anchors(self, frame, anchors, net_type, fpn_cnt):
         datapath = os.path.join(cfg.ROOT_DIR,'debug')
         if not os.path.isdir(datapath):
             os.mkdir(datapath)
-        out_file = os.path.join(datapath,'{}_anchors_{}.png'.format(self._cnt,net_type))
+        out_file = os.path.join(datapath,'{}_anchors_{}_{}.png'.format(self._cnt,net_type,fpn_cnt))
         if(net_type == 'lidar'):
             img = self._draw_and_save_lidar_anchors(frame,anchors)
         elif(net_type == 'image'):
