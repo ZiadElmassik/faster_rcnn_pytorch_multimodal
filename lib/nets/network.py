@@ -62,6 +62,7 @@ class Network(nn.Module):
         self._proposal_cnt     = 0
         self._anchors          = None
         self._anchors_cache    = None
+        self._anchors_3d_cache = None
         self._device           = 'cuda'
         self._net_type                        = cfg.NET_TYPE
         self._bbox_means = torch.tensor(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).to(device=self._device)
@@ -197,7 +198,8 @@ class Network(nn.Module):
 
     def _anchor_component(self, height, width, feat_stride):
         if(self._anchors_cache is None):
-            self._anchors_cache = {}
+            self._anchors_cache    = {}
+            self._anchors_3d_cache = {}
         if(feat_stride not in self._anchors_cache.items()):
             if(self._net_type == 'image'):
                 if(cfg.USE_FPN):
@@ -208,15 +210,16 @@ class Network(nn.Module):
                                                     height, width,
                                                     feat_stride, anchor_scales, self._anchor_ratios, self._frame_scale)
                 #TODO: Unused, shouldn't use unless lidar. fix please.
-                self._anchors_3d = torch.from_numpy(anchors).to(self._device)
+                self._anchors_3d_cache[feat_stride] = torch.from_numpy(anchors).to(self._device)
             elif(self._net_type == 'lidar'):
                 anchor_generator = GridAnchor3dGenerator()
                 anchor_length, anchors = anchor_generator._generate(height, width, feat_stride, self._anchor_scales, self._anchor_ratios, self._frame_scale)
-                self._anchors_3d = torch.from_numpy(anchors).to(self._device)
+                self._anchors_3d_cache[feat_stride] = torch.from_numpy(anchors).to(self._device)
                 anchors = bbox_utils.bbaa_graphics_gems(anchors, (width)*feat_stride-1, (height)*feat_stride-1)
             self._anchors_cache[feat_stride] = torch.from_numpy(anchors).to(self._device)
             #self._anchors = torch.from_numpy(anchors).to(self._device)
         self._anchors       = self._anchors_cache[feat_stride]
+        self._anchors_3d    = self._anchors_3d_cache[feat_stride]
         self._anchor_length = len(self._anchors_cache[feat_stride])
         if(cfg.DEBUG.DRAW_ANCHORS or cfg.DEBUG.DRAW_ANCHOR_T):
             self._anchor_targets['anchors'] = self._anchors
@@ -375,16 +378,12 @@ class Network(nn.Module):
             else:
                 raise NotImplementedError
         if(self._mode != 'TEST'):
-            if(cfg.USE_FPN):
-                rpn_pred_dict = ['rpn_cls_score_reshape','rpn_bbox_pred']
-                for rpn_pred in rpn_pred_dict:
-                    if(rpn_pred not in self._predictions.keys()):
-                        self._predictions[rpn_pred] = []
-                self._predictions['rpn_cls_score_reshape'].append(rpn_cls_score_reshape)
-                self._predictions['rpn_bbox_pred'].append(rpn_bbox_pred)
-            else:
-                self._predictions['rpn_cls_score_reshape'] = rpn_cls_score_reshape
-                self._predictions['rpn_bbox_pred'] = rpn_bbox_pred
+            rpn_pred_dict = ['rpn_cls_score_reshape','rpn_bbox_pred']
+            for rpn_pred in rpn_pred_dict:
+                if(rpn_pred not in self._predictions.keys()):
+                    self._predictions[rpn_pred] = []
+            self._predictions['rpn_cls_score_reshape'].append(rpn_cls_score_reshape)
+            self._predictions['rpn_bbox_pred'].append(rpn_bbox_pred)
         return rois, roi_scores, anchors_3d
     #Used to dynamically change batch size depending on eval or train
     def set_e_num_sample(self,e_num_sample):
@@ -802,25 +801,23 @@ class Network(nn.Module):
         self._predict()
         #ENABLE to draw all anchors
         if(cfg.DEBUG.DRAW_ANCHORS):
-            if(cfg.USE_FPN):
-                for i,(k,v) in enumerate(self._anchors_cache.items()):
-                    self._draw_and_save_anchors(frame,
-                                                v,
-                                                self._net_type,
-                                                k)
+            for i,(k,v) in enumerate(self._anchors_cache.items()):
+                self._draw_and_save_anchors(frame,
+                                            v,
+                                            self._net_type,
+                                            k)
         #ENABLE to draw all anchor targets
         if(cfg.DEBUG.DRAW_ANCHOR_T):
-            if(cfg.USE_FPN):
-                for i,(k,v) in enumerate(self._anchors_cache.items()):
-                    self._draw_and_save_targets(frame,
-                                                self._anchor_targets['rpn_bbox_targets'][i],
-                                                v,
-                                                None,
-                                                self._anchor_targets['rpn_labels'][i],
-                                                self._anchor_targets['rpn_bbox_inside_weights'][i],
-                                                'anchor',
-                                                self._net_type,
-                                                k)
+            for i,(k,v) in enumerate(self._anchors_cache.items()):
+                self._draw_and_save_targets(frame,
+                                            self._anchor_targets['rpn_bbox_targets'][i],
+                                            v,
+                                            None,
+                                            self._anchor_targets['rpn_labels'][i],
+                                            self._anchor_targets['rpn_bbox_inside_weights'][i],
+                                            'anchor',
+                                            self._net_type,
+                                            k)
         #ENABLE to draw all proposal targets
         if(cfg.DEBUG.DRAW_PROPOSAL_T):
             self._draw_and_save_targets(frame,

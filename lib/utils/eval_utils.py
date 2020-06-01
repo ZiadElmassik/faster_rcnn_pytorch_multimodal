@@ -73,12 +73,6 @@ def parse_rec(filename):
 
     return objects
 
-def get_frame_path(db, mode, eval_type):
-    if(eval_type == 'bev' or eval_type == '3d' or eval_type == 'bev_aa'):
-        frame_path = os.path.join(db._devkit_path, mode, 'point_clouds')
-    elif(eval_type == '2d'):
-        frame_path = os.path.join(db._devkit_path, mode, 'images')
-    return frame_path
 
 def get_labels_filename(db, eval_type):
     if(eval_type == 'bev' or eval_type == '3d' or eval_type == 'bev_aa'):
@@ -272,33 +266,6 @@ def find_rec(class_recs, token):
             else:
                 return None
     return None
-    
-def write_det(R,bb,var,jmax=None):
-    scene    = R['scene_idx']
-    frame    = R['frame_idx']
-    out_str  = ''
-    out_str += 'scene_idx: {} frame_idx: {} '.format(scene,frame)
-    out_str += 'bbdet: '
-    for bbox_elem in bb:
-        out_str += '{:4.3f} '.format(bbox_elem)
-    for key,val in var.items():
-        out_str += '{}: '.format(key)
-        for var_elem in val:
-            out_str += '{:4.3f} '.format(var_elem)
-    if(jmax is not None):
-        pts        = R['pts'][jmax]
-        difficulty = R['difficulty'][jmax]
-        track_id   = R['ids'][jmax]
-        class_t    = R['gt_classes'][jmax]
-        bbgt       = R['boxes'][jmax]
-        out_str   += 'track_idx: {} '.format(track_id)
-        out_str   += 'difficulty: {} '.format(difficulty)
-        out_str   += 'pts: {} '.format(pts)
-        out_str   += 'cls: {} '.format(class_t)
-        out_str   += 'bbgt: '
-        for bbox_elem in bbgt:
-            out_str += '{:4.3f} '.format(bbox_elem)
-    return out_str
 
 def save_detection_results(results,pathdir,filename):
     if not os.path.isdir(pathdir):
