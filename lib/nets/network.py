@@ -221,7 +221,7 @@ class Network(nn.Module):
         self._anchors       = self._anchors_cache[feat_stride]
         self._anchors_3d    = self._anchors_3d_cache[feat_stride]
         self._anchor_length = len(self._anchors_cache[feat_stride])
-        if(cfg.DEBUG.DRAW_ANCHORS or cfg.DEBUG.DRAW_ANCHOR_T):
+        if((cfg.DEBUG.DRAW_ANCHORS and cfg.DEBUG.EN) or cfg.DEBUG.DRAW_ANCHOR_T):
             self._anchor_targets['anchors'] = self._anchors
 
     def _add_rpn_losses(self,sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights):
@@ -619,7 +619,7 @@ class Network(nn.Module):
         #pool5 = pool5.mean(3).mean(2).unsqueeze(0).repeat(self._e_num_sample,1,1)
         if(self._dropout_en):
             conv_dropout_rate = 0.2
-            fc_dropout_rate   = 0.5
+            fc_dropout_rate   = 0.4
         else:
             conv_dropout_rate = 0.0
             fc_dropout_rate   = 0.0
@@ -800,14 +800,14 @@ class Network(nn.Module):
 
         self._predict()
         #ENABLE to draw all anchors
-        if(cfg.DEBUG.DRAW_ANCHORS):
+        if(cfg.DEBUG.DRAW_ANCHORS and cfg.DEBUG.EN):
             for i,(k,v) in enumerate(self._anchors_cache.items()):
                 self._draw_and_save_anchors(frame,
                                             v,
                                             self._net_type,
                                             k)
         #ENABLE to draw all anchor targets
-        if(cfg.DEBUG.DRAW_ANCHOR_T):
+        if(cfg.DEBUG.DRAW_ANCHOR_T and cfg.DEBUG.EN):
             for i,(k,v) in enumerate(self._anchors_cache.items()):
                 self._draw_and_save_targets(frame,
                                             self._anchor_targets['rpn_bbox_targets'][i],
@@ -819,7 +819,7 @@ class Network(nn.Module):
                                             self._net_type,
                                             k)
         #ENABLE to draw all proposal targets
-        if(cfg.DEBUG.DRAW_PROPOSAL_T):
+        if(cfg.DEBUG.DRAW_PROPOSAL_T and cfg.DEBUG.EN):
             self._draw_and_save_targets(frame,
                                         self._proposal_targets['bbox_targets'],
                                         self._proposal_targets['rois'],
@@ -1269,7 +1269,7 @@ class Network(nn.Module):
             img = None
         draw = ImageDraw.Draw(img)
         for i, bbox in enumerate(anchors.data.cpu().numpy()):
-            if(i%900 < 9):
+            if(i%100 < 9):
                 c = (255,255,255)
                 if(i%3 == 0):
                     c = (255,0,0)
