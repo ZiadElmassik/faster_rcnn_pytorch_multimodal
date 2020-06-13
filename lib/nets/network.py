@@ -294,7 +294,7 @@ class Network(nn.Module):
             #Compute aleatoric class entropy
             if(cfg.UC.EN_CLS_ALEATORIC):
                 a_cls_var  = self._predictions['a_cls_var']
-                cross_entropy, a_cls_mutual_info = loss_utils.bayesian_cross_entropy(cls_score, a_cls_var, label,cfg.UC.A_NUM_CE_SAMPLE)
+                cross_entropy, a_cls_mutual_info = loss_utils.bayesian_cross_entropy_simple(cls_score, a_cls_var, label,cfg.UC.A_NUM_CE_SAMPLE)
                 self._losses['a_cls_var']     = torch.mean(a_cls_var)
                 #Classical entropy w/out logit sampling
                 #self._losses['a_entropy'] = torch.mean(loss_utils.categorical_entropy(cls_prob))
@@ -586,12 +586,12 @@ class Network(nn.Module):
         if(self._dropout_en):
             out  = self.cls_drop1(fc7_reshape)
         out  = self.cls_fc1(out)
-        out  = self.cls_bn1(out)
+        #out  = self.cls_bn1(out)
         out  = fc_relu(out)
         if(self._dropout_en):
             out  = self.cls_drop1(out)
         out  = self.cls_fc2(out)
-        out  = self.cls_bn2(out)
+        #out  = self.cls_bn2(out)
         out  = fc_relu(out)
         if(self._dropout_en):
             out  = self.cls_drop2(out)
@@ -602,12 +602,12 @@ class Network(nn.Module):
         fc7_reshape = fc7.view(-1,fc7.shape[2])
         fc_relu      = nn.ReLU(inplace=True)
         out     = self.bbox_fc1(fc7_reshape)
-        out   = self.bbox_bn1(out)
+        #out   = self.bbox_bn1(out)
         out   = fc_relu(out)
         if(self._dropout_en):
             out   = self.bbox_drop1(out)
         out   = self.bbox_fc2(out)
-        out   = self.bbox_bn2(out)
+        #out   = self.bbox_bn2(out)
         out   = fc_relu(out)
         if(self._dropout_en):
             out   = self.bbox_drop2(out)
