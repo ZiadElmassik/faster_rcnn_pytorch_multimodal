@@ -11,8 +11,8 @@ import cv2
 import matplotlib.pyplot as plt
 import scipy.stats as scipy_stats
 mypath = '/home/mat/thesis/data2/waymo'
-detection_file = os.path.join(mypath,'results','vehicle.car_detection_results_simple.txt')
-gt_file        = os.path.join(mypath,'val','labels','image_labels.json')
+detection_file = os.path.join(mypath,'results','vehicle.car_detection_results_3d.txt')
+gt_file        = os.path.join(mypath,'val','labels','lidar_labels.json')
 #column_names = ['assoc_frame','scene_idx','frame_idx','bbdet','a_cls_var','a_cls_entropy','a_cls_mutual_info','e_cls_entropy','e_cls_mutual_info','a_bbox_var','e_bbox_var','track_idx','difficulty','pts','cls_idx','bbgt']
 num_scenes = 210
 
@@ -23,7 +23,8 @@ def parse_dets(det_file):
     int_en        = False
     skip_cols     = 0
     for i, line in enumerate(det_file):
-        line = line.replace('bbdet', ' bbdet')
+        #line = line.replace('bbdet', ' bbdet')
+        line = line.replace('bbgt: -1 -1 -1 -1 -1 -1 -1', '')
         line = line.replace('\n','').split(' ')
         row = []
         row.append(i)
@@ -43,13 +44,11 @@ def parse_dets(det_file):
                         skip_cols = 1
                     elif('idx' in col or 'pts' in col or 'difficulty' in col):
                         int_en = True
-                    elif('bb' in col and '3d' not in col):
-                        row.append([float(line[j+1]),float(line[j+2]),float(line[j+3]),float(line[j+4])])
-                        skip_cols = 4
-                    elif('bb' in col and '3d' in col):
+                    elif('bb' in col):
                         row.append([float(line[j+1]),float(line[j+2]),float(line[j+3]),float(line[j+4]),float(line[j+5]),float(line[j+6]),float(line[j+7])])
                         skip_cols = 7
                     if(col not in column_names and col != ''):
+                        #print(col)
                         column_names.append(col)
             else:
                 skip_cols = skip_cols - 1
@@ -158,61 +157,51 @@ def plot_histo_bbox_uc(dets,scene,min_val,max_val):
         if('a_bbox_var' in column):
             labelname = scene + '_' + column
             data = dets[column].to_list()
-            bbgt = dets['bbgt'].to_list()
-            bbdet = dets['bbdet'].to_list()
+            #bbgt = dets['bbgt'].to_list()
+            #bbdet = dets['bbdet'].to_list()
             hist_data = []
-            data = np.asarray(data)
-            data = np.sum(data,axis=1)
-            bbdet = np.asarray(bbdet)
-            bbox_area = (bbdet[:,2]-bbdet[:,0])*(bbdet[:,3]-bbdet[:,1]) + 1
-            #print(len(bbox_area))
-            #data = data/bbox_area
-            #data = data/bbox_area
-            #for i, bbox_var in enumerate(data):
-            #
-            #    bbox_area = (bbdet[i][2]-bbdet[i][0])*(bbdet[i][3]-bbdet[i][1]) + 1
-            #    variance = sum(bbox_var)
-            #    #variance = sum(bbox_var)/4
-            #    hist_data.append(variance)
+            for i, bbox_var in enumerate(data):
+
+                #bbox_area = (bbdet[i][2]-bbdet[i][0])*(bbdet[i][3]-bbdet[i][1]) + 1
+                variance = sum(bbox_var)
+                #variance = sum(bbox_var)/4
+                hist_data.append(variance)
             #max_val = max(hist_data)
             #min_val = min(hist_data)
             #mean    = np.mean(hist_data)
             #hist_data = (hist_data-min_val)/(max_val-min_val)
-            plt.hist(data,bins=200,range=[min_val,max_val],alpha=0.5,label=labelname,density=True,stacked=True)
+            plt.hist(hist_data,bins=100,range=[min_val,max_val],alpha=0.5,label=labelname,density=True,stacked=True)
     #bboxes = bboxes.to_dict(orient="list")
-    return data
+    return hist_data 
 
 if __name__ == '__main__':
     with open(detection_file) as det_file:
         dets_df  = parse_dets(det_file.readlines())
     df  = parse_labels(dets_df, gt_file)
-    print(df)
     #df  = df.loc[df['difficulty'] != -1]
-    #df   = df.loc[df['confidence'] > 0.9]
     night_dets = df.loc[df['tod'] == 'Night']
     day_dets = df.loc[df['tod'] == 'Day']
+    scene_dets = df.loc[df['scene_idx'] == 168]
     rain_dets = df.loc[df['weather'] == 'rain']
     sun_dets = df.loc[df['weather'] == 'sunny']
-    scene_dets = df.loc[df['scene_idx'] == 168]
+    #far_dets = df.loc[df['bbdet'][0] > 30]
+    #near_dets = df.loc[df['bbdet'][0] <= 30]
     diff1_dets = df.loc[df['difficulty'] != 2]
     diff2_dets = df.loc[df['difficulty'] == 2]
-    minm = 0
+    minm = 0.0
     maxm = 10000
-    scene_data = plot_histo_bbox_uc(scene_dets,'scene',minm,maxm)
-    #night_data = plot_histo_bbox_uc(night_dets,'night',minm,maxm)
-    day_data   = plot_histo_bbox_uc(day_dets,'day',minm,maxm)
-    #day_mean = np.mean(day_dets)
-    day_mean = np.mean(day_data)
-    #print(len(night_data))
+    #plot_histo_bbox_uc(night_dets,'night',minm,maxm)
+    #plot_histo_bbox_uc(day_dets,'day',minm,maxm)
+    night_data = plot_histo_bbox_uc(night_dets,'night',minm,maxm)
+    day_data = plot_histo_bbox_uc(day_dets,'day',minm,maxm)
+    print(len(night_data))
     print(len(day_data))
-    #r = scipy_stats.poisson.rvs(day_mean)
-    result = scipy_stats.ks_2samp(day_data,scene_data)
+    result = scipy_stats.ks_2samp(day_data,night_data)
     print(result)
-    #plot_histo_bbox_uc(rain_dets,'rain',minm,maxm)
-    #plot_histo_cls_uc(night_dets,'night',minm,maxm)
-    #plot_histo_cls_uc(day_dets,'day',minm,maxm)
     #plot_histo_cls_uc(rain_dets,'rain',minm,maxm)
     #plot_histo_cls_uc(sun_dets,'sunny',minm,maxm)
+    #plot_histo_cls_uc(night_dets,'night',minm,maxm)
+    #plot_histo_cls_uc(day_dets,'day',minm,maxm)
     #plot_histo_bbox_uc(diff2_dets,'lvl2',minm,maxm)
     #plot_histo_bbox_uc(diff1_dets,'lvl1',minm,maxm)
     plt.legend()

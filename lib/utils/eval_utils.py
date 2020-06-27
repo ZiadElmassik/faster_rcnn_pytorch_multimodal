@@ -366,6 +366,8 @@ def eval_3d_iou(bbgt, bbdet):
         inter = gt_poly.intersection(det_poly).area
         union = gt_poly.union(det_poly).area
         inter_vol = inter*inter_height
+        if(inter_vol < 0):
+            inter_vol = 0
         #Compute iou 3d by including heights, as height is axis aligned
         iou_3d = inter_vol/(gt_poly.area*gt_height + det_poly.area*det_height - inter_vol)
         overlaps[i] = iou_3d
