@@ -543,6 +543,9 @@ class Network(nn.Module):
         else:
             cls_score_in = fc7
         cls_score = self.cls_score_net(cls_score_in)
+        #torch.set_printoptions(profile="full")
+        #print(cls_score)
+        #torch.set_printoptions(profile="default")
         if(cfg.UC.EN_BBOX_EPISTEMIC):
             bbox_pred_in = self._bbox_tail(fc7)
         else:
@@ -878,6 +881,7 @@ class Network(nn.Module):
                 #Traditional bbox output
                 if(self._net_type == 'image'):
                     mean_bbox_inv = bbox_transform_inv(rois,bbox_mean,self._frame_scale)
+                    mean_bbox_inv = clip_boxes(mean_bbox_inv,self._info)
                 elif(self._net_type == 'lidar'):
                     mean_bbox_inv = lidar_3d_bbox_transform_inv(self._predictions['rois'][:,1:5],anchors_3d,bbox_mean,self._frame_scale)
                 
