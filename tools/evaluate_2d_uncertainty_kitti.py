@@ -182,8 +182,13 @@ def plot_histo_bbox_uc(dets,scene,min_val,max_val):
     #bboxes = bboxes.to_dict(orient="list")
     return data
 
-def get_kitti_val_frames():
-    return None
+def get_kitti_val_frames(filepath):
+    filename = os.path.join(filepath,'evaluation','val_split.txt')
+    frames = None
+    with open(filename) as fp:
+        frames = np.asarray(fp.readlines())
+    frames = [int(element.replace('\n','')) for element in frames]
+    return frames
 
 
 if __name__ == '__main__':
@@ -191,12 +196,12 @@ if __name__ == '__main__':
         df  = parse_dets(det_file.readlines())
     #df  = parse_labels(dets_df, gt_file)
     print(df)
-    frames = get_kitti_val_frames()
-    frames = df['frame_idx'].unique()
+    frames = get_kitti_val_frames(mypath)
+    #frames = df['frame_idx'].unique()
     print(frames)
     det_out_dir = os.path.join(mypath,'evaluation','detections')
     for frame in frames:
-        det_file = os.path.join(det_out_dir,'{:07}.txt'.format(frame))
+        det_file = os.path.join(det_out_dir,'{:06}.txt'.format(frame))
         frame_df = df.loc[df['frame_idx'] == frame]
         #print(frame_df)
         fp = open(det_file,'w+')

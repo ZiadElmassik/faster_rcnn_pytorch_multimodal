@@ -63,6 +63,7 @@ class Network(nn.Module):
         self._anchors          = None
         self._anchors_cache    = None
         self._anchors_3d_cache = None
+        self._sigma_rpn        = 1.0
         self._device           = 'cuda'
         self._net_type                        = cfg.NET_TYPE
         self._bbox_means = torch.tensor(cfg.TRAIN[self._net_type.upper()].BBOX_NORMALIZE_MEANS).to(device=self._device)
@@ -251,7 +252,7 @@ class Network(nn.Module):
         return rpn_cross_entropy, rpn_loss_box
 
     #Determine losses for single batch image
-    def _add_losses(self, sigma_rpn=3.0):
+    def _add_losses(self):
         # RPN, class loss
         rpn_cross_entropy = None
         rpn_loss_box      = None
@@ -266,7 +267,7 @@ class Network(nn.Module):
             rpn_bbox_targets         = self._anchor_targets['rpn_bbox_targets'][i]
             rpn_bbox_inside_weights  = self._anchor_targets['rpn_bbox_inside_weights'][i]
             rpn_bbox_outside_weights = self._anchor_targets['rpn_bbox_outside_weights'][i]
-            s_rpn_cross_entropy, s_rpn_loss_box = self._add_rpn_losses(sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights)
+            s_rpn_cross_entropy, s_rpn_loss_box = self._add_rpn_losses(self._sigma_rpn,rpn_cls_score,rpn_label,rpn_bbox_pred,rpn_bbox_targets,rpn_bbox_inside_weights,rpn_bbox_outside_weights)
             if(rpn_cross_entropy is None):
                 rpn_cross_entropy = s_rpn_cross_entropy
             else:
@@ -870,7 +871,7 @@ class Network(nn.Module):
                         #Manually expand anchors just as ROI's to match the bbox_sample multiplier
                         anchor_3d_coords = anchors_3d.unsqueeze(0).repeat(cfg.UC.A_NUM_BBOX_SAMPLE,1,1)
                         anchor_3d_coords = anchor_3d_coords.view(-1,anchor_3d_coords.shape[2])
-                        bbox_inv_samples = lidar_3d_bbox_transform_inv(roi_coords,anchor_3d_coords,bbox_samples,self._frame_scale)
+                        bbox_inv_samples = lidar_3d_bbox_transform_inv(roi_coords,anchor_3d_coords,bbox_samples,self._frame_scale,ry_asin=cfg.LIDAR.EN_RY_SIN)
                         #Convert into true point cloud scale before computing variance
                         area_extents = [cfg.LIDAR.X_RANGE[0],cfg.LIDAR.Y_RANGE[0],cfg.LIDAR.Z_RANGE[0],cfg.LIDAR.X_RANGE[1],cfg.LIDAR.Y_RANGE[1],cfg.LIDAR.Z_RANGE[1]]
                         bbox_inv_samples = bbox_utils.bbox_voxel_grid_to_pc(bbox_inv_samples,area_extents,info)

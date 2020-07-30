@@ -132,7 +132,7 @@ def plot_histo_cls_uc(dets,scene,min_val,max_val):
     #ax = dets.plot.hist(column='a_bbox_var',bins=12,alpha=0.5)
     bboxes = dets.columns
     for column in bboxes:
-        if('a_mutual_info' in column):
+        if('a_entropy' in column):
             labelname = scene + '_' + column
             data = dets[column].to_list()
             conf_list = dets['confidence'].to_list()
@@ -197,20 +197,20 @@ if __name__ == '__main__':
     diff1_dets = df.loc[df['difficulty'] != 2]
     diff2_dets = df.loc[df['difficulty'] == 2]
     minm = 0
-    maxm = 10000
-    scene_data = plot_histo_bbox_uc(scene_dets,'scene',minm,maxm)
+    maxm = 1
+    #scene_data = plot_histo_bbox_uc(scene_dets,'scene',minm,maxm)
     #night_data = plot_histo_bbox_uc(night_dets,'night',minm,maxm)
-    day_data   = plot_histo_bbox_uc(day_dets,'day',minm,maxm)
+    #day_data   = plot_histo_bbox_uc(day_dets,'day',minm,maxm)
     #day_mean = np.mean(day_dets)
-    day_mean = np.mean(day_data)
+    #day_mean = np.mean(day_data)
     #print(len(night_data))
-    print(len(day_data))
+    #print(len(day_data))
     #r = scipy_stats.poisson.rvs(day_mean)
-    result = scipy_stats.ks_2samp(day_data,scene_data)
-    print(result)
+    #result = scipy_stats.ks_2samp(day_data,scene_data)
+    #print(result)
     #plot_histo_bbox_uc(rain_dets,'rain',minm,maxm)
-    #plot_histo_cls_uc(night_dets,'night',minm,maxm)
-    #plot_histo_cls_uc(day_dets,'day',minm,maxm)
+    plot_histo_cls_uc(night_dets,'night',minm,maxm)
+    plot_histo_cls_uc(day_dets,'day',minm,maxm)
     #plot_histo_cls_uc(rain_dets,'rain',minm,maxm)
     #plot_histo_cls_uc(sun_dets,'sunny',minm,maxm)
     #plot_histo_bbox_uc(diff2_dets,'lvl2',minm,maxm)
