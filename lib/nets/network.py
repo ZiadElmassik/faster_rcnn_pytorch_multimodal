@@ -871,7 +871,7 @@ class Network(nn.Module):
                         #Manually expand anchors just as ROI's to match the bbox_sample multiplier
                         anchor_3d_coords = anchors_3d.unsqueeze(0).repeat(cfg.UC.A_NUM_BBOX_SAMPLE,1,1)
                         anchor_3d_coords = anchor_3d_coords.view(-1,anchor_3d_coords.shape[2])
-                        bbox_inv_samples = lidar_3d_bbox_transform_inv(roi_coords,anchor_3d_coords,bbox_samples,self._frame_scale,ry_asin=cfg.LIDAR.EN_RY_SIN)
+                        bbox_inv_samples = lidar_3d_bbox_transform_inv(roi_coords,anchor_3d_coords,bbox_samples,self._frame_scale)
                         #Convert into true point cloud scale before computing variance
                         area_extents = [cfg.LIDAR.X_RANGE[0],cfg.LIDAR.Y_RANGE[0],cfg.LIDAR.Z_RANGE[0],cfg.LIDAR.X_RANGE[1],cfg.LIDAR.Y_RANGE[1],cfg.LIDAR.Z_RANGE[1]]
                         bbox_inv_samples = bbox_utils.bbox_voxel_grid_to_pc(bbox_inv_samples,area_extents,info)
