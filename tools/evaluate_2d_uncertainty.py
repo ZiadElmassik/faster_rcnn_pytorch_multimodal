@@ -11,7 +11,8 @@ import cv2
 import matplotlib.pyplot as plt
 import scipy.stats as scipy_stats
 mypath = '/home/mat/thesis/data2/waymo'
-detection_file = os.path.join(mypath,'results','vehicle.car_detection_results_simple.txt')
+date = 'aug02'
+detection_file = os.path.join(mypath,'uncertainty_output',date,'image.txt')
 gt_file        = os.path.join(mypath,'val','labels','image_labels.json')
 #column_names = ['assoc_frame','scene_idx','frame_idx','bbdet','a_cls_var','a_cls_entropy','a_cls_mutual_info','e_cls_entropy','e_cls_mutual_info','a_bbox_var','e_bbox_var','track_idx','difficulty','pts','cls_idx','bbgt']
 num_scenes = 210
@@ -43,6 +44,9 @@ def parse_dets(det_file):
                         skip_cols = 1
                     elif('idx' in col or 'pts' in col or 'difficulty' in col):
                         int_en = True
+                    elif('cls_var' in col):
+                        row.append([float(line[j+1]),float(line[j+2])])
+                        skip_cols = 2
                     elif('bb' in col and '3d' not in col):
                         row.append([float(line[j+1]),float(line[j+2]),float(line[j+3]),float(line[j+4])])
                         skip_cols = 4
@@ -155,7 +159,7 @@ def plot_histo_bbox_uc(dets,scene,min_val,max_val):
     #ax = dets.plot.hist(column='a_bbox_var',bins=12,alpha=0.5)
     bboxes = dets.filter(like='bb').columns
     for column in bboxes:
-        if('a_bbox_var' in column):
+        if('e_bbox_var' in column):
             labelname = scene + '_' + column
             data = dets[column].to_list()
             bbgt = dets['bbgt'].to_list()
@@ -196,11 +200,11 @@ if __name__ == '__main__':
     scene_dets = df.loc[df['scene_idx'] == 168]
     diff1_dets = df.loc[df['difficulty'] != 2]
     diff2_dets = df.loc[df['difficulty'] == 2]
-    minm = 0
-    maxm = 1
+    minm = -10
+    maxm = 10
     #scene_data = plot_histo_bbox_uc(scene_dets,'scene',minm,maxm)
-    #night_data = plot_histo_bbox_uc(night_dets,'night',minm,maxm)
-    #day_data   = plot_histo_bbox_uc(day_dets,'day',minm,maxm)
+    night_data = plot_histo_bbox_uc(night_dets,'night',minm,maxm)
+    day_data   = plot_histo_bbox_uc(day_dets,'day',minm,maxm)
     #day_mean = np.mean(day_dets)
     #day_mean = np.mean(day_data)
     #print(len(night_data))
@@ -209,8 +213,8 @@ if __name__ == '__main__':
     #result = scipy_stats.ks_2samp(day_data,scene_data)
     #print(result)
     #plot_histo_bbox_uc(rain_dets,'rain',minm,maxm)
-    plot_histo_cls_uc(night_dets,'night',minm,maxm)
-    plot_histo_cls_uc(day_dets,'day',minm,maxm)
+    #plot_histo_cls_uc(night_dets,'night',minm,maxm)
+    #plot_histo_cls_uc(day_dets,'day',minm,maxm)
     #plot_histo_cls_uc(rain_dets,'rain',minm,maxm)
     #plot_histo_cls_uc(sun_dets,'sunny',minm,maxm)
     #plot_histo_bbox_uc(diff2_dets,'lvl2',minm,maxm)

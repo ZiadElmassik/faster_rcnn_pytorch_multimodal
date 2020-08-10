@@ -157,22 +157,25 @@ def extract_uncertainties(bbox_elem, splitlines):
     if(cfg.UC.EN_CLS_ALEATORIC):
         uc_avg['a_entropy']  = np.zeros((cfg.NUM_SCENES,1))
         uc_avg['a_mutual_info'] = np.zeros((cfg.NUM_SCENES,1))
-        uc_avg['a_cls_var'] = np.zeros((cfg.NUM_SCENES,1))
+        uc_avg['a_cls_var'] = np.zeros((cfg.NUM_SCENES,2))
         #uncertainties['a_cls_var'] = np.array([[float(z) for z in x[u_start:u_start+1]] for x in splitlines])
         #u_start += 1
         uncertainties['a_entropy'] = np.array([[float(z) for z in x[u_start:u_start+1]] for x in splitlines])
         u_start += 1
         uncertainties['a_mutual_info'] = np.array([[float(z) for z in x[u_start:u_start+1]] for x in splitlines])
         u_start += 1
-        uncertainties['a_cls_var'] = np.array([[float(z) for z in x[u_start:u_start+1]] for x in splitlines])
-        u_start += 1
+        uncertainties['a_cls_var'] = np.array([[float(z) for z in x[u_start:u_start+2]] for x in splitlines])
+        u_start += 2
     if(cfg.UC.EN_CLS_EPISTEMIC):
         uc_avg['e_entropy'] = np.zeros((cfg.NUM_SCENES,1))
         uc_avg['e_mutual_info'] = np.zeros((cfg.NUM_SCENES,1))
+        uc_avg['e_cls_var']     = np.zeros((cfg.NUM_SCENES,2))
         uncertainties['e_entropy'] = np.array([[float(z) for z in x[u_start:u_start+1]] for x in splitlines])
         u_start += 1
         uncertainties['e_mutual_info'] = np.array([[float(z) for z in x[u_start:u_start+1]] for x in splitlines])
         u_start += 1
+        uncertainties['e_cls_var'] = np.array([[float(z) for z in x[u_start:u_start+2]] for x in splitlines])
+        u_start += 2
     if(cfg.UC.EN_BBOX_ALEATORIC):
         uc_avg['a_bbox_var'] = np.zeros((cfg.NUM_SCENES,bbox_elem))
         uncertainties['a_bbox_var'] = np.array([[float(z) for z in x[u_start:u_start+bbox_elem]] for x in splitlines])
