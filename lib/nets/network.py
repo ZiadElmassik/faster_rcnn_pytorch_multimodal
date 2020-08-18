@@ -294,7 +294,7 @@ class Network(nn.Module):
             #Flag to only handle a_bbox_var if enabled
             #Compute aleatoric class entropy
             if(cfg.UC.EN_CLS_ALEATORIC):
-                a_cls_var  = torch.exp(self._predictions['a_cls_var'])  #torch.pow(self._predictions['a_cls_var'],2)  #torch.exp(self._predictions['a_cls_var'])
+                a_cls_var  = torch.pow(self._predictions['a_cls_var'],2)  #torch.pow(self._predictions['a_cls_var'],2)  #torch.exp(self._predictions['a_cls_var'])
                 cross_entropy, a_cls_mutual_info = loss_utils.bayesian_cross_entropy(cls_score, a_cls_var, label,cfg.UC.A_NUM_CE_SAMPLE)
                 self._losses['a_cls_var']     = torch.mean(a_cls_var)
                 #Classical entropy w/out logit sampling
@@ -574,7 +574,7 @@ class Network(nn.Module):
             a_cls_var   = self.cls_al_var_net(cls_score_in)
             #Remove any 
             a_cls_var = torch.mean(a_cls_var,dim=0)
-            self._predictions['a_cls_var']   = a_cls_var
+            self._predictions['a_cls_var'] = a_cls_var  #torch.exp(a_cls_var)
 
         self._mc_run_output['bbox_pred'] = bbox_pred
         self._mc_run_output['cls_score'] = cls_score
@@ -966,7 +966,7 @@ class Network(nn.Module):
             #TODO: This should not be taking the mean yet, we need to filter by top indices
             #a_cls_entropy = -torch.mean(a_cls_entropy)*torch.log(torch.mean(a_cls_entropy)) - (1-torch.mean(a_cls_entropy))*torch.log(1-torch.mean(a_cls_entropy))
             a_cls_entropy                      = loss_utils.categorical_entropy(cls_prob)
-            distorted_cls_score                = loss_utils.logit_distort(cls_score,torch.exp(cls_var),cfg.UC.A_NUM_CE_SAMPLE)  #torch.pow(cls_var,2),cfg.UC.A_NUM_CE_SAMPLE)  #torch.exp(cls_var),cfg.UC.A_NUM_CE_SAMPLE)
+            distorted_cls_score                = loss_utils.logit_distort(cls_score,torch.pow(cls_var,2),cfg.UC.A_NUM_CE_SAMPLE)  #torch.pow(cls_var,2),cfg.UC.A_NUM_CE_SAMPLE)  #torch.exp(cls_var),cfg.UC.A_NUM_CE_SAMPLE)
             a_cls_mutual_info                  = loss_utils.categorical_mutual_information(distorted_cls_score)
             uncertainties['a_entropy']         = a_cls_entropy.data.detach()
             uncertainties['a_mutual_info']     = a_cls_mutual_info
@@ -1239,17 +1239,17 @@ class Network(nn.Module):
                 draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
                 draw.rectangle(np_bbox,width=1,outline='green')
                 if(np_bbox[0] >= np_bbox[2]):
-                    print('x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
+                    print('1 x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
                 if(np_bbox[1] >= np_bbox[3]):
-                    print('y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
+                    print('1 y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
             elif(bbox_label == 0):
                 np_bbox = roi.data.cpu().numpy()
                 draw.text((np_bbox[0],np_bbox[1]),"class: {}".format(bbox_label))
                 draw.rectangle(np_bbox,width=1,outline='red')
                 if(np_bbox[0] >= np_bbox[2]):
-                    print('x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
+                    print('0 x1 {} x2 {}'.format(np_bbox[0],np_bbox[2]))
                 if(np_bbox[1] >= np_bbox[3]):
-                    print('y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
+                    print('0 y1 {} y2 {}'.format(np_bbox[1],np_bbox[3]))
         img.save(out_file,'png')
 
 

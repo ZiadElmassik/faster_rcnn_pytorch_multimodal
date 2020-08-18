@@ -10,10 +10,10 @@ import pandas as pd
 import cv2
 import scipy.stats as scipy_stats
 mypath = '/home/mat/thesis/data2/waymo'
-date = 'aug09'
-detection_file = os.path.join(mypath,'uncertainty_output',date,'image.txt')
-detection_file_2 = os.path.join(mypath,'uncertainty_output',date,'image_dropout_p_0_2.txt')
-detection_file_3 = os.path.join(mypath,'uncertainty_output',date,'image_dropout_p_0_4.txt')
+date = 'aug11'
+detection_file = os.path.join(mypath,'uncertainty_output',date,'image_pow2.txt')
+#detection_file_2 = os.path.join(mypath,'uncertainty_output',date,'image_dropout_p_0_2.txt')
+#detection_file_3 = os.path.join(mypath,'uncertainty_output',date,'image_dropout_p_0_4.txt')
 gt_file        = os.path.join(mypath,'val','labels','image_labels.json')
 #column_names = ['assoc_frame','scene_idx','frame_idx','bbdet','a_cls_var','a_cls_entropy','a_cls_mutual_info','e_cls_entropy','e_cls_mutual_info','a_bbox_var','e_bbox_var','track_idx','difficulty','pts','cls_idx','bbgt']
 num_scenes = 210
@@ -152,9 +152,9 @@ def plot_histo_cls_uc(dets,scene,min_val,max_val,uc_type='a_cls_var',cls_sel=Non
             conf_list = dets['confidence'].to_list()
             hist_data = []
             data_arr = np.asarray(data)
-            if('a_cls_var' in column):
+            #if('a_cls_var' in column):
                 #data_arr = np.power(data_arr,2)
-                data_arr  = np.exp(data_arr)
+                #data_arr  = np.exp(data_arr)
             #data_mean = np.mean(data_arr[:,1])
             #data_var  = np.var(data_arr[:,0])
             data_max  = data_arr.max(axis=0)
@@ -173,7 +173,7 @@ def plot_histo_cls_uc(dets,scene,min_val,max_val,uc_type='a_cls_var',cls_sel=Non
             #hist_data = (hist_data-min_val)/(max_val-min_val)
             #variance = conf_list/variance
             if(fit):
-                x = np.arange(0,1,.001)
+                x = np.arange(min_val,max_val,.0001)
                 shape,loc,scale = scipy_stats.invgamma.fit(variance)
                 g1 = scipy_stats.invgamma.pdf(x=x, a=shape, loc=loc, scale=scale)
                 plt.plot(x,g1,label='{} fitted_gamma: {:.3f} {:.3f} {:.3f}'.format(scene,shape,loc,scale))
@@ -188,7 +188,7 @@ def plot_histo_bbox_uc(dets,scene,min_val,max_val,fit=False):
     #ax = dets.plot.hist(column='a_bbox_var',bins=12,alpha=0.5)
     bboxes = dets.filter(like='bb').columns
     for column in bboxes:
-        if('a_bbox_var' in column):
+        if('e_bbox_var' in column):
             labelname = scene + '_' + column
             data = dets[column].to_list()
             #bbgt = dets['bbgt'].to_list()
@@ -199,10 +199,10 @@ def plot_histo_bbox_uc(dets,scene,min_val,max_val,fit=False):
             data_var  = np.var(data_arr,axis=0)
             data_max  = data_arr.max(axis=0)
             #print(data_mean)
-            data_arr = data_arr[:,1]/data_max[1]
+            data_arr = data_arr/data_max
             #data_sum = np.sum(data,axis=1)
             if(fit):
-                x = np.arange(0,2,.0001)
+                x = np.arange(min_val,max_val,.0001)
                 shape,loc,scale = scipy_stats.invgamma.fit(data_arr)
                 g1 = scipy_stats.invgamma.pdf(x=x, a=shape, loc=loc, scale=scale)
                 plt.plot(x,g1,label='{} fitted_gamma: {:.3f} {:.3f} {:.3f}'.format(scene,shape,loc,scale))
@@ -228,15 +228,16 @@ if __name__ == '__main__':
         dets_df  = parse_dets(det_file.readlines())
     df  = parse_labels(dets_df, gt_file)
 
-    with open(detection_file_2) as det_file:
-        dets_df_2  = parse_dets(det_file.readlines())
-    df_2  = parse_labels(dets_df_2, gt_file)
+    #with open(detection_file_2) as det_file:
+    #    dets_df_2  = parse_dets(det_file.readlines())
+    #df_2  = parse_labels(dets_df_2, gt_file)
 
-    with open(detection_file_3) as det_file:
-        dets_df_3  = parse_dets(det_file.readlines())
-    df_3  = parse_labels(dets_df_3, gt_file)
-    #df  = df.loc[df['confidence'] > 0.85]
+    #with open(detection_file_3) as det_file:
+    #    dets_df_3  = parse_dets(det_file.readlines())
+    #df_3  = parse_labels(dets_df_3, gt_file)
+    df  = df.loc[df['confidence'] > 0.5]
     df_n = df.loc[df['tod'] == 'Night']
+    df_d = df.loc[df['tod'] == 'Day']
     df_s = df.loc[df['weather'] == 'sunny']
     df_r = df.loc[df['weather'] == 'rain']
     #df   = df.loc[df['tod'] == 'Day']
@@ -244,7 +245,15 @@ if __name__ == '__main__':
     df3  = df.loc[df['difficulty'] == -1]
     df4  = df_n.loc[df_n['difficulty'] != -1]
     df5  = df_n.loc[df_n['difficulty'] == -1]
-    df2_2 = df_2.loc[df_2['difficulty'] != -1]
+    df_s_1  = df_s.loc[df_s['difficulty'] != -1]
+    df_s_2  = df_s.loc[df_s['difficulty'] == -1]
+    df_r_1  = df_r.loc[df_r['difficulty'] != -1]
+    df_r_2  = df_r.loc[df_r['difficulty'] == -1]
+    df_d_1  = df_d.loc[df_d['difficulty'] != -1]
+    df_d_2  = df_d.loc[df_d['difficulty'] == -1]
+    df_n_1  = df_n.loc[df_n['difficulty'] != -1]
+    df_n_2  = df_n.loc[df_n['difficulty'] == -1]
+    #df2_2 = df_2.loc[df_2['difficulty'] != -1]
     #df2   = df.loc[df['confidence'] > 0.5]
     #df3   = df.loc[df['confidence'] <= 0.5]
     #day_dets = df.loc[df['tod'] == 'Day']
@@ -256,10 +265,17 @@ if __name__ == '__main__':
     #diff1_dets = df.loc[df['difficulty'] != 2]
     #diff2_dets = df.loc[df['difficulty'] == 2]
     minm = 0.0
-    maxm = 1.0
+    maxm = 0.05
     #plot_histo_bbox_uc(night_dets,'night',minm,maxm)
-    day_data   = plot_histo_bbox_uc(df2,'base-TP',minm,maxm,fit=True)
-    plot_histo_bbox_uc(df,'base',minm,maxm,fit=False)
+    #plot_histo_bbox_uc(df2,'TP',minm,maxm,fit=False)
+    #plot_histo_bbox_uc(df3,'FP',minm,maxm,fit=False)
+    #plot_histo_bbox_uc(df_d_1,'day-TP',minm,maxm,fit=True)
+    #plot_histo_bbox_uc(df_d_2,'day-FP',minm,maxm,fit=False)
+    #plot_histo_bbox_uc(df_n_1,'night-TP',minm,maxm,fit=True)
+    #plot_histo_bbox_uc(df_n_2,'night-FP',minm,maxm,fit=False)
+    #plot_histo_bbox_uc(df_r_1,'Rain-TP',minm,maxm,fit=False)
+    #plot_histo_bbox_uc(df_s_2,'Sun-FP',minm,maxm,fit=True)
+    #plot_histo_bbox_uc(df_r_2,'Rain-FP',minm,maxm,fit=False)
     #plot_histo_bbox_uc(df_2,'dropout p=0.2',minm,maxm,fit=False)
     #plot_histo_bbox_uc(df_3,'dropout p=0.4',minm,maxm,fit=False)
     #day_data   = plot_histo_bbox_uc(df4,'tp-N',minm,maxm)
@@ -269,8 +285,10 @@ if __name__ == '__main__':
     #print(len(day_data))
     #result = scipy_stats.ks_2samp(day_data,night_data)
     #print(result)
-    #plot_histo_cls_uc(df,'all',minm,maxm,uc_type='e_entropy',fit=False,cls_sel=1)
-    #plot_histo_cls_uc(df2,'tp',minm,maxm,uc_type='e_entropy',fit=False,cls_sel=1)
+    plot_histo_cls_uc(df_d_1,'tp-sun',minm,maxm,uc_type='a_cls_var',fit=False,cls_sel=1)
+    plot_histo_cls_uc(df_d_2,'fp-sun',minm,maxm,uc_type='a_cls_var',fit=False,cls_sel=1)
+    plot_histo_cls_uc(df_n_1,'tp-night',minm,maxm,uc_type='a_cls_var',fit=False,cls_sel=1)
+    plot_histo_cls_uc(df_n_2,'fp-night',minm,maxm,uc_type='a_cls_var',fit=False,cls_sel=1)
     #plot_histo_cls_uc(df_2,'all-corrupted',minm,maxm,uc_type='e_entropy',cls_sel=1)
     #plot_histo_cls_uc(df3,'fp',minm,maxm,uc_type='a_cls_var',cls_sel=1)
     #plot_histo_cls_uc(rain_dets,'rain',minm,maxm,0)
