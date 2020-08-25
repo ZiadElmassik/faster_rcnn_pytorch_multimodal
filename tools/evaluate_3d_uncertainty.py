@@ -10,14 +10,14 @@ import pandas as pd
 import cv2
 import scipy.stats as scipy_stats
 mypath = '/home/mat/thesis/data2/waymo'
-date = 'aug11'
-detection_file = os.path.join(mypath,'uncertainty_output',date,'image_pow2.txt')
+date = 'aug24'
+detection_file = os.path.join(mypath,'uncertainty_output',date,'waymo_det.txt')
 #detection_file_2 = os.path.join(mypath,'uncertainty_output',date,'image_dropout_p_0_2.txt')
 #detection_file_3 = os.path.join(mypath,'uncertainty_output',date,'image_dropout_p_0_4.txt')
 gt_file        = os.path.join(mypath,'val','labels','image_labels.json')
 #column_names = ['assoc_frame','scene_idx','frame_idx','bbdet','a_cls_var','a_cls_entropy','a_cls_mutual_info','e_cls_entropy','e_cls_mutual_info','a_bbox_var','e_bbox_var','track_idx','difficulty','pts','cls_idx','bbgt']
 num_scenes = 210
-mode_2d = True
+mode_2d = False
 def parse_dets(det_file):
     data_rows     = []
     column_names  = ['ID']
@@ -235,7 +235,8 @@ if __name__ == '__main__':
     #with open(detection_file_3) as det_file:
     #    dets_df_3  = parse_dets(det_file.readlines())
     #df_3  = parse_labels(dets_df_3, gt_file)
-    df  = df.loc[df['confidence'] > 0.5]
+    #df  = df.loc[df['confidence'] > 0.5]
+    df = 
     df_n = df.loc[df['tod'] == 'Night']
     df_d = df.loc[df['tod'] == 'Day']
     df_s = df.loc[df['weather'] == 'sunny']
