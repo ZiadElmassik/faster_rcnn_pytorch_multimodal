@@ -8,35 +8,13 @@ from PIL import Image, ImageDraw
 from enum import Enum
 import pandas as pd
 import cv2
+import csv
 import matplotlib.pyplot as plt
 import scipy.stats as scipy_stats
 import pickle
 from scipy.stats import lognorm
 from scipy.stats import norm
 from scipy.stats import halfnorm
-dataset  = 'kitti'
-homepath = '/home/mat/thesis/'
-datapath = os.path.join(homepath,'data',dataset)
-projpath  = os.path.join(homepath,'faster_rcnn_pytorch_multimodal')
-imgpath = datapath + '/data2/waymo/val/images/'  # can join these later for completion
-savepath = datapath + '/2d_uncertainty_drawn/'
-splitpath = datapath + '/faster_rcnn_pytorch_multimodal/tools/splits/'
-#detection_file = os.path.join(mypath,'faster_rcnn_pytorch_multimodal','tools','results','vehicle.car_detection_results_simple.txt')
-#detection_file = os.path.join(mypath,'uncertainty_output','aug24','3d_waymo_det_2.txt')
-#detection_file = os.path.join(mypath,'faster_rcnn_pytorch_multimodal','tools','results_kitti','image.txt')
-#detection_file = os.path.join(mypath,'faster_rcnn_pytorch_multimodal','tools','results_kitti','kitti_200.txt')
-gt_path = os.path.join(datapath,'training','label_2')
-
-detection_file = os.path.join(projpath,'final_releases','lidar','kitti','base+aug_a_e_uc','3d_bev_results.txt')
-val_split_file = os.path.join(datapath,'splits','val.txt')  # from kitti validation
-
-cache_dir = os.path.join(datapath,'cache_dir')
-#detection_file = os.path.join(mypath,'faster_rcnn_pytorch_multimodal','tools','results','lidar_3d_iou_uncertainty_results.txt')
-gt_file        = os.path.join(datapath,'val','labels','lidar_labels.json')
-#column_names = ['assoc_frame','scene_idx','frame_idx','bbdet','a_cls_var','a_cls_entropy','a_cls_mutual_info','e_cls_entropy','e_cls_mutual_info','a_bbox_var','e_bbox_var','track_idx','difficulty','pts','cls_idx','bbgt']
-num_scenes = 210
-top_crop = 300
-bot_crop = 30
 
 def parse_dets(det_file):
     if ("3d" in detection_file):  # is the file from lidar or img domain
@@ -129,6 +107,79 @@ def parse_labels(dets_df, gt_file):
     full_df['tod'] = full_df['scene_idx'].map(tod_dict)
     full_df['calibration'] = full_df['scene_idx'].map(calibration_dict)
     return full_df
+
+def cadc_parse_labels(dets_df, scene_file):
+    drive_dir       = ['2018_03_06','2018_03_07','2019_02_27']
+    #2018_03_06
+    # Seq | Snow  | Road Cover | Lens Cover
+    #   1 | None  |     N      |     N
+    #   5 | Med   |     N      |     Y
+    #   6 | Heavy |     N      |     Y
+    #   9 | Light |     N      |     Y
+    #  18 | Light |     N      |     N
+
+    #2018_03_07
+    # Seq | Snow  | Road Cover | Lens Cover
+    #   1 | Heavy |     N      |     Y
+    #   4 | Light |     N      |     N
+    #   5 | Light |     N      |     Y
+
+    #2019_02_27
+    # Seq | Snow  | Road Cover | Lens Cover
+    #   5 | Light |     Y      |     N
+    #   6 | Heavy |     Y      |     N
+    #  15 | Med   |     Y      |     N
+    #  28 | Light |     Y      |     N
+    #  37 | Extr  |     Y      |     N
+    #  46 | Extr  |     Y      |     N
+    #  59 | Med   |     Y      |     N
+    #  73 | Light |     Y      |     N
+    #  75 | Med   |     Y      |     N
+    #  80 | Heavy |     Y      |     N
+
+    with open(scene_file,'r') as csvfile:
+        scene_meta = {}
+        reader = csv.reader(csvfile, delimiter=',', quotechar='|')
+        for i, row in enumerate(reader):
+            for j, elem in enumerate(row):
+                if(i == 0):
+                    elem_t = elem.replace(' ','_').lower()
+                    scene_meta[elem_t] = []
+                else:
+                    for k, (key,_) in enumerate(scene_meta.items()):
+                        if j == k:
+                            scene_meta[key].append(elem)
+    scene_column = np.asarray(dets_df['frame_idx'],dtype=np.int32)/100
+    scene_column = scene_column.astype(dtype=np.int32)
+    dets_df['scene_idx'] = scene_column
+    snow_dict = {}
+    dates = scene_meta['date']
+    scenes = scene_meta['number']
+    lens_snow_cover = scene_meta['cam_00_lens_snow_cover']
+    road_snow_cover = scene_meta['road_snow_cover']
+    snow_pts_rem    = scene_meta['snow_points_removed']
+    snow_level = []
+    scene_idx  = []
+    for i, snow_tmp in enumerate(snow_pts_rem):
+        date = dates[i]
+        snow_tmp = int(snow_tmp)
+        if(snow_tmp < 25):
+            scene_desc = 'none'
+        elif(snow_tmp < 250):
+            scene_desc = 'light'
+        elif(snow_tmp < 500):
+            scene_desc = 'medium'
+        elif(snow_tmp < 750):
+            scene_desc = 'heavy'
+        else:
+            scene_desc = 'extreme'
+        scene_idx.append(drive_dir.index(date)*100 + int(scenes[i]))
+        snow_level.append(scene_desc)
+    snow_dict = dict(zip(scene_idx,snow_level))
+    dets_df['lens_snow_cover'] = dets_df['scene_idx'].map(dict(zip(scene_idx,lens_snow_cover)))
+    dets_df['road_snow_cover'] = dets_df['scene_idx'].map(dict(zip(scene_idx,road_snow_cover)))
+    dets_df['snow_level'] = dets_df['scene_idx'].map(snow_dict)
+    return dets_df
 
 '''
 monte carlo sampler 3D to 2D xyxy
@@ -273,71 +324,6 @@ def plot_histo_chi_squared(dets,scene,min_val,max_val):
             #sns.distplot(data,label='fitting curve')
             #plt.hist(r,bins=200,range=[min_val,max_val],alpha=0.5,label='r',density=True,stacked=True)
     #bboxes = bboxes.to_dict(orient="list")
-    return data
-
-def plot_histo_lognorm(df,dets,scene,min_val,max_val):
-    bboxes = dets.filter(like='bb').columns
-    a_bbox_var = np.asarray(df['a_bbox_var'].to_list())
-    a_bbox_var = np.sort(np.sum(a_bbox_var,axis=1))  # sum and sort
-    a_bbox_var_std_dev = np.std(a_bbox_var)
-
-    e_bbox_var = np.asarray(df['e_bbox_var'].to_list())
-    e_bbox_var = np.sort(np.sum(e_bbox_var,axis=1))  # sum and sort
-    e_bbox_var_std_dev = np.std(e_bbox_var)
-
-    for column in bboxes:
-        if('a_bbox_var' in column):
-            labelname = scene + '_' + column
-            data = dets[column].to_list()  # uncertainty
-            bbgt = dets['bbgt'].to_list()
-            bbdet = dets['bbdet'].to_list()
-            hist_data = []
-            data = np.asarray(data)
-            data = np.sort(np.sum(data,axis=1))  # sum and sort
-            range = np.max(data) - np.min(data)
-            data_truncated = data[data < range*0.20]
-            data_truncated = (data_truncated)/e_bbox_var_std_dev  # convert to z scores            
-            df = 4  # degrees of freedom
-            x_range = np.arange(np.min(data_truncated),np.max(data_truncated),0.001)
-            data_mean = np.mean(data_truncated)
-            s,loc,scale = lognorm.fit(data_truncated,floc=0)
-            estimated_mu = np.log(scale)
-            estimated_sigma = s  # shape is std dev
-            estimated_mu = float("{:.3f}".format(estimated_mu))
-            estimated_sigma = float("{:.3f}".format(estimated_sigma))
-            pdf = lognorm.pdf(x_range,s,scale=scale)
-            plt.plot(x_range,pdf,label='fitted_lognorm_pdf')
-            plt.hist(data_truncated,bins=200,range=[np.min(data_truncated),np.max(data_truncated)+1],alpha=0.5,label=labelname,density=True,stacked=True)
-            plt.text(1.5,1.2,r'$\mu=$''%s\n'r'$\sigma=$''%s'%(np.mean(data_truncated),estimated_sigma)) 
-    return data, estimated_mu, estimated_sigma
-
-
-def plot_histo_half_gaussian(df,dets,scene,min_val,max_val):
-    bboxes = dets.filter(like='bb').columns
-    a_bbox_var = np.asarray(df['a_bbox_var'].to_list())
-    a_bbox_var = np.sort(np.sum(a_bbox_var,axis=1))  # sum and sort
-    a_bbox_var_std_dev = np.std(a_bbox_var)
-    for column in bboxes:
-        if('a_bbox_var' in column):
-            labelname = scene + '_' + column
-            data = dets[column].to_list()  # uncertainty
-            #bbgt = dets['bbgt'].to_list()
-            #bbdet = dets['bbdet'].to_list()
-            #hist_data = []
-            data = np.asarray(data)
-            data = np.sort(np.sum(data,axis=1))  # sum and sort
-            range = np.max(data) - np.min(data)
-            data_truncated = data[data < range*0.20]
-            data_truncated = (data_truncated)/a_bbox_var_std_dev  # convert to z scores            
-            x_range = np.arange(np.min(data_truncated),np.max(data_truncated),0.001)
-            loc,scale = halfnorm.fit(data_truncated,floc=0)
-            estimated_mu = float("{:.3f}".format(np.mean(data_truncated)))
-            estimated_sigma = float("{:.3f}".format(np.std(data_truncated)))
-            pdf = halfnorm.pdf(x_range,scale=scale)
-
-            plt.plot(x_range,pdf,label='fitted_halfnorm_pdf')
-            #plt.hist(data_truncated,bins=200,range=[np.min(data_truncated),np.max(data_truncated)+1],alpha=0.5,label=labelname,density=True,stacked=True)
-            #plt.text(1.5,1.2,r'$\mu=$''%s\n'r'$\sigma=$''%s'%(estimated_mu,estimated_sigma)) 
     return data
 
 def extract_bad_predictions(df,confidence):
@@ -510,10 +496,12 @@ def get_df(cache_dir,det_path):
         df = []
         with open(detection_file) as det_file:
             dets_df  = parse_dets(det_file.readlines())
-        if ('kitti' not in det_path):
-            df  = parse_labels(dets_df, gt_file)
-        else:
+        if (dataset == 'kitti'):
             df = dets_df
+        elif(dataset == 'cadc'):
+            df = cadc_parse_labels(dets_df,scene_file)
+        else:
+            df = parse_labels(dets_df, gt_file)
 
         with open(cache_file, 'wb') as fid:
             pickle.dump(df, fid, pickle.HIGHEST_PROTOCOL)
@@ -693,6 +681,31 @@ def count_kitti_npos(val_split_file,gt_path,df):
     
     return npos
 
+
+def count_cadc_npos(gt_path,df):
+    """
+    Function to calculate total number of ground truths from kitti dataset
+    Use the split val.txt to index label files. In each label file count instances of "car" detections
+    args: val_split_file, gt_path, dataframe
+    returns: npos (num ground truths)
+    """
+    #npos += cadc_label_npos(gt_path,stripped_line)
+    det_idx = 0
+    npos = np.zeros(3)
+    labels = os.listdir(gt_path)
+    frame_idx = np.asarray(df['frame_idx'])
+    unique_idx = np.unique(np.sort(frame_idx), axis=0)
+
+    for label in labels:
+        label_int = int(label.replace('.txt',''))
+        if det_idx == len(unique_idx):
+            break
+        if (unique_idx[det_idx] == label_int):
+            npos += cadc_label_npos(gt_path,label.replace('.txt',''))
+            det_idx += 1
+    
+    return npos
+
 def kitti_label_npos(path,filename):
     """
     Function to count each car ground truth inside a label file. filepath comes from
@@ -725,6 +738,30 @@ def kitti_label_npos(path,filename):
                     count[1:3] += 1
                 elif(occ <= 2 and trunc <= 0.5 and (BBGT_HEIGHT) >= 25): # difficulty 2
                     count[2] += 1
+    return count
+
+def cadc_label_npos(path,filename):
+    """
+    Function to count each car ground truth inside a label file. filepath comes from
+    kitti split file.
+    args: path, filename
+    returns: count (npos instance inside 1 file)
+
+    Difficulty calculation was taken from kitt_lidb.py
+    trunc = float(label_arr[1])
+    occ   = int(label_arr[2])
+    y1 = float(label_arr[5])
+    y2 = float(label_arr[7])
+    BBGT_HEIGHT = y2 - y1
+    """
+
+    count = np.zeros(3)
+    label_file = os.path.join(path,filename+'.txt')
+    with open(label_file,'r') as file:
+        for line in file:
+            line_arr = line.split(' ')
+            if (line[0:2] == 'Ca'):
+                count[0:3] += 1
     return count
 
 def unique(det_list):
@@ -784,8 +821,10 @@ def calculate_ap(df,d_levels,display=False):
     mrec = np.zeros((d_levels,))
     mprec = np.zeros((d_levels,))
 
-    if 'kitti' in detection_file:  # detection_file still in scope
-        npos = count_kitti_npos(val_split_file,gt_path,df)
+    if 'cadc' in detection_file:
+        npos = count_cadc_npos(cadc_gt_path,df)
+    elif 'kitti' in detection_file:  # detection_file still in scope
+        npos = count_kitti_npos(val_split_file,kitti_gt_path,df)
     else:
         npos = count_npos(gt_file,df)
     df_sorted = df.sort_values(by='confidence',ascending=False)
@@ -823,17 +862,21 @@ def calculate_ap(df,d_levels,display=False):
     print(map)
     return mrec,mprec,map
 
-def plot_histo_bbox_uc(dets,scene,min_val,max_val):
+def plot_histo_bbox_uc(dets,scene,min_val=None,max_val=None):
     #ax = dets.plot.hist(column='a_bbox_var',bins=12,alpha=0.5)
     bboxes = dets.filter(like='bb').columns
     for column in bboxes:
-        if('e_bbox_var' in column):
+        if('a_bbox_var' in column):
             labelname = scene + '_' + column
             data = dets[column].to_list()
             #bbgt = dets['bbgt3d'].to_list()
             #bbdet = dets['bbdet3d'].to_list()
             hist_data = []
-            data = np.asarray(data)[:,2]
+            data = np.asarray(data)[:,3]
+            if(max_val is None):
+                max_val = np.max(data)
+            if(min_val is None):
+                min_val = np.min(data)
             #data = np.sum(data,axis=1)
             #bbdet = np.asarray(bbdet)
             #bbox_area = (bbdet[:,2]-bbdet[:,0])*(bbdet[:,3]-bbdet[:,1]) + 1
@@ -850,10 +893,34 @@ def plot_histo_bbox_uc(dets,scene,min_val,max_val):
             #min_val = min(hist_data)
             #mean    = np.mean(hist_data)
             #hist_data = (hist_data-min_val)/(max_val-min_val)
-            plt.hist(data,bins=200,range=[min_val,max_val],alpha=0.5,label=labelname,density=True,stacked=True)
+            plt.hist(data,bins=150,range=[min_val,max_val],alpha=0.5,label=labelname,density=True,stacked=True)
     #bboxes = bboxes.to_dict(orient="list")
     return data
 
+
+dataset  = 'waymo'
+sensor_type = 'lidar'
+homepath = '/home/mat/thesis/'
+if(dataset == 'waymo'):
+    data_dir = 'data2'
+else:
+    data_dir = 'data'
+datapath = os.path.join(homepath,data_dir,dataset)
+projpath  = os.path.join(homepath,'faster_rcnn_pytorch_multimodal')
+imgpath = datapath + '/data2/waymo/val/images/'  # can join these later for completion
+savepath = datapath + '/2d_uncertainty_drawn/'
+splitpath = datapath + '/faster_rcnn_pytorch_multimodal/tools/splits/'
+cadc_gt_path = os.path.join(datapath,'val','annotation_00') 
+kitti_gt_path = os.path.join(datapath,'training','label_2')
+detection_file = os.path.join(projpath,'final_releases',sensor_type,dataset,'base+aug_a_e_uc_2c','3d_test_results','3d_results.txt')
+val_split_file = os.path.join(datapath,'splits','val.txt')  # from kitti validation
+scene_file = os.path.join(datapath,'cadc_scene_description.csv')
+cache_dir = os.path.join(datapath,'cache_dir')
+gt_file        = os.path.join(datapath,'val','labels','{}_labels.json'.format(sensor_type))
+#column_names = ['assoc_frame','scene_idx','frame_idx','bbdet','a_cls_var','a_cls_entropy','a_cls_mutual_info','e_cls_entropy','e_cls_mutual_info','a_bbox_var','e_bbox_var','track_idx','difficulty','pts','cls_idx','bbgt']
+num_scenes = 210
+top_crop = 300
+bot_crop = 30
 
 if __name__ == '__main__': 
     df = get_df(cache_dir,detection_file)
@@ -862,6 +929,14 @@ if __name__ == '__main__':
     #print(df)
     df_tp = df.loc[df['difficulty'] != -1]
     df_fp = df.loc[df['difficulty'] == -1]
+    #df_easy = df.loc[((df['snow_level'] == 'none') | (df['snow_level'] == 'light'))]
+    #df_ext = df.loc[((df['snow_level'] == 'extreme') | (df['snow_level'] == 'heavy'))]
+    #df_easy = df.loc[(df['lens_snow_cover'] == 'None')]
+    #df_ext = df.loc[(df['lens_snow_cover'] == 'Partial')]
+    #df_ext_tp = df_ext.loc[df_ext['difficulty'] != -1]
+    #df_ext_fp = df_ext.loc[df_ext['difficulty'] == -1]
+    #df_easy_tp = df_easy.loc[df_easy['difficulty'] != -1]
+    #df_easy_fp = df_easy.loc[df_easy['difficulty'] == -1]
     #df   = df.loc[df['confidence'] > 0.9]
     #night_dets = df.loc[df['tod'] == 'Night']
     #day_dets = df.loc[df['tod'] == 'Day']
@@ -872,8 +947,10 @@ if __name__ == '__main__':
     #diff2_dets = df.loc[df['difficulty'] == 2]
     minm = 0.0
     maxm = 0.001
-    scene_data = plot_histo_bbox_uc(df_tp,'TP',minm,maxm)
-    night_data = plot_histo_bbox_uc(df_fp,'FP',minm,maxm)
+    scene_data = plot_histo_bbox_uc(df_tp,'TP')
+    night_data = plot_histo_bbox_uc(df_fp,'FP')
+    #night_data = plot_histo_bbox_uc(df_ext_tp,'heavy-TP')
+    #night_data = plot_histo_bbox_uc(df_ext_fp,'heavy-FP')
     # day_data   = plot_histo_bbox_uc(day_dets,'day',minm,maxm)
     #day_mean = np.mean(day_dets)
     # day_mean = np.mean(day_data)
